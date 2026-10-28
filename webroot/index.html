@@ -27,6 +27,7 @@ body{
   padding:env(safe-area-inset-top) 16px calc(env(safe-area-inset-bottom) + 24px);
   font-size:15px; line-height:1.45; -webkit-font-smoothing:antialiased;
   transition:background .3s,color .3s;
+  overflow-x:hidden;
 }
 .wrap{max-width:520px;margin:0 auto}
 
@@ -51,6 +52,7 @@ h1{font-size:26px;font-weight:700;letter-spacing:-.5px}
   border:1px solid var(--line); border-radius:var(--radius);
   box-shadow:var(--shadow); padding:18px; margin-bottom:14px;
   transition:transform .18s cubic-bezier(.4,0,.2,1),box-shadow .18s;
+  min-width:0;
 }
 .card:active{transform:scale(.985)}
 .card-title{
@@ -66,17 +68,59 @@ h1{font-size:26px;font-weight:700;letter-spacing:-.5px}
 .hero-unit{font-size:17px;font-weight:600;color:var(--text2)}
 .hero-hint{font-size:13px;color:var(--text2);margin-top:6px}
 
-/* 网格 */
-.grid{display:grid;grid-template-columns:1fr 1fr;gap:11px}
-.grid3{display:grid;grid-template-columns:repeat(3,1fr);gap:11px}
+/* 网格
+   注意：1fr 等价 minmax(auto,1fr)，最小宽度是内容的最小宽度，
+   窄屏下会被内容（如 "49.0℃"）撑破容器。必须用 minmax(0,1fr) 允许收缩。 */
+.grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:11px}
+.grid3{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:11px}
+.grid4{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:8px}
+@media(max-width:380px){.grid4{grid-template-columns:repeat(4,minmax(0,1fr));gap:6px}}
 .item{
   background:var(--card-solid); border-radius:13px; padding:13px;
   border:1px solid var(--line);
+  min-width:0; overflow:hidden;
 }
-.item .k{font-size:11.5px;color:var(--text2);margin-bottom:5px;font-weight:500}
-.item .v{font-size:19px;font-weight:650;font-variant-numeric:tabular-nums;letter-spacing:-.3px}
+.item .k{font-size:11.5px;color:var(--text2);margin-bottom:5px;font-weight:500;
+  white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.item .v{font-size:19px;font-weight:650;font-variant-numeric:tabular-nums;letter-spacing:-.3px;
+  white-space:nowrap}
 .item .v small{font-size:12px;font-weight:500;color:var(--text2);margin-left:2px}
+
+/* CPU 各核：auto-fit + minmax 保证永不撑破容器，窄屏自动降列 */
+#cpuGrid{
+  display:grid;
+  grid-template-columns:repeat(auto-fit, minmax(68px, 1fr));
+  gap:8px;
+}
+#cpuGrid .item{
+  padding:9px 4px; text-align:center;
+  min-width:0; overflow:hidden;
+}
+#cpuGrid .k{font-size:10.5px;margin-bottom:4px;letter-spacing:0;
+  white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+#cpuGrid .v{font-size:15px;letter-spacing:-.5px;white-space:nowrap}
+#cpuGrid .v small{font-size:10px;margin-left:0}
 .v.green{color:var(--green)} .v.orange{color:var(--orange)} .v.red{color:var(--red)} .v.accent{color:var(--accent)}
+
+/* CPU 各核：按温度暖度着色 */
+.item.t-cool{background:rgba(48,209,88,.07);border-color:rgba(48,209,88,.20)}
+.item.t-warm{background:rgba(255,159,10,.09);border-color:rgba(255,159,10,.22)}
+.item.t-hot{background:rgba(255,59,48,.10);border-color:rgba(255,59,48,.26)}
+
+/* 温度墙滑条 */
+.wall-row{display:flex;align-items:center;gap:12px;margin-top:12px}
+.wall-row .k{font-size:12px;color:var(--text2);font-weight:500;white-space:nowrap;flex-shrink:0}
+.wall-slider-wrap{flex:1;min-width:0;display:flex;align-items:center;gap:11px}
+.wall-slider-wrap input[type=range]{
+  flex:1;min-width:0; -webkit-appearance:none; appearance:none; height:5px; border-radius:3px;
+  background:var(--line); outline:none;
+}
+.wall-slider-wrap input[type=range]::-webkit-slider-thumb{
+  -webkit-appearance:none; appearance:none; width:19px; height:19px; border-radius:50%;
+  background:var(--accent); box-shadow:0 2px 8px rgba(10,132,255,.40); cursor:pointer;
+}
+.wall-val{font-size:15px;font-weight:650;font-variant-numeric:tabular-nums;white-space:nowrap;flex-shrink:0;min-width:42px;text-align:right}
+.wall-val b{color:var(--accent)}
 
 /* 进度条 */
 .bar{height:6px;background:var(--line);border-radius:100px;overflow:hidden;margin-top:10px}
@@ -100,7 +144,7 @@ h1{font-size:26px;font-weight:700;letter-spacing:-.5px}
 .row-d{font-size:11.5px;color:var(--text2);margin-top:1px}
 
 /* 按钮 */
-.btns{display:grid;grid-template-columns:1fr 1fr;gap:11px;margin-bottom:14px}
+.btns{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:11px;margin-bottom:14px}
 .btn{
   padding:15px;border-radius:15px;border:none;font-size:15px;font-weight:600;
   font-family:inherit;cursor:pointer;transition:all .16s;
@@ -170,7 +214,7 @@ footer{text-align:center;font-size:11.5px;color:var(--text2);padding:14px 0 4px;
 .slider-ends{display:flex;justify-content:space-between;font-size:11px;color:var(--text2);margin-top:2px}
 
 /* 亮度预设按钮 */
-.presets{display:grid;grid-template-columns:repeat(4,1fr);gap:8px;margin-top:14px}
+.presets{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:8px;margin-top:14px}
 .preset{
   padding:11px 4px;border-radius:12px;border:1px solid var(--line);
   background:var(--card-solid);font-family:inherit;font-size:12.5px;font-weight:600;
@@ -300,7 +344,7 @@ footer{text-align:center;font-size:11.5px;color:var(--text2);padding:14px 0 4px;
     </div>
     <div class="grid">
       <div class="item">
-        <div class="k">CPU</div>
+        <div class="k">CPU（最高核）</div>
         <div class="v"><span id="cpuReal" class="orange">--</span> <small>/</small> <span id="cpuFake" class="green">--</span></div>
       </div>
       <div class="item">
@@ -318,6 +362,69 @@ footer{text-align:center;font-size:11.5px;color:var(--text2);padding:14px 0 4px;
     </div>
     <div class="hero-hint" style="margin-top:12px;font-size:12px">
       <span class="orange">橙色=真实温度</span>　<span class="green">绿色=系统读到的伪装值</span>
+    </div>
+  </div>
+
+  <!-- CPU 各核温度 -->
+  <div class="card fade">
+    <div class="card-title">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="4" y="4" width="16" height="16" rx="2"/><rect x="9" y="9" width="6" height="6"/><path d="M9 2v2m6-2v2M9 20v2m6-2v2M2 9h2m-2 6h2M20 9h2m-2 6h2"/></svg>
+      CPU 各核温度
+      <span style="flex:1"></span>
+      <span class="hero-hint" style="font-size:11.5px;margin:0">最高 <b id="cpuMax" style="color:var(--orange)">--</b></span>
+    </div>
+    <div class="grid4" id="cpuGrid">
+      <div class="item"><div class="k">核心 0</div><div class="v" id="cpu0">--</div></div>
+      <div class="item"><div class="k">核心 1</div><div class="v" id="cpu1">--</div></div>
+      <div class="item"><div class="k">核心 2</div><div class="v" id="cpu2">--</div></div>
+      <div class="item"><div class="k">核心 3</div><div class="v" id="cpu3">--</div></div>
+      <div class="item"><div class="k">核心 4</div><div class="v" id="cpu4">--</div></div>
+      <div class="item"><div class="k">核心 5</div><div class="v" id="cpu5">--</div></div>
+      <div class="item"><div class="k">核心 6</div><div class="v" id="cpu6">--</div></div>
+      <div class="item"><div class="k">核心 7</div><div class="v" id="cpu7">--</div></div>
+    </div>
+    <div class="hero-hint" style="margin-top:10px;font-size:12px">
+      温度越高底色越暖，超过 51℃ 标红
+    </div>
+  </div>
+
+  <!-- 充电温度墙 -->
+  <div class="card fade" id="wallCard">
+    <div class="card-title">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 2l9 4v6c0 5.25-3.75 10-9 10S3 17.25 3 12V6l9-4z"/></svg>
+      充电温度墙
+      <span style="flex:1"></span>
+      <span class="pill" style="font-size:11.5px" id="wallPill">--</span>
+    </div>
+    <div class="row" style="margin-bottom:4px">
+      <div class="row-l">
+        <div>
+          <div class="row-t">电池到阈值就限制充电电流</div>
+          <div class="row-d" id="wallDesc">未到阈值时不干预</div>
+        </div>
+      </div>
+      <button class="switch" id="wallSwitch" onclick="toggleWall()"></button>
+    </div>
+    <div class="wall-row">
+      <div class="k">触发温度</div>
+      <div class="wall-slider-wrap">
+        <input type="range" id="wallRange" min="35" max="60" step="1" value="51"
+               oninput="onWallInput(this.value)" onchange="setWall(this.value)">
+        <div class="wall-val"><b id="wallVal">51</b>℃</div>
+      </div>
+    </div>
+    <div class="grid" style="margin-top:14px">
+      <div class="item">
+        <div class="k">当前电池真实温度</div>
+        <div class="v orange" id="wallBatt">--<small>℃</small></div>
+      </div>
+      <div class="item">
+        <div class="k">充电电流上限</div>
+        <div class="v" id="wallCurr">--</div>
+      </div>
+    </div>
+    <div class="hero-hint" style="margin-top:10px;font-size:12px" id="wallState">
+      阈值以下全速充电，超过后按档位递减
     </div>
   </div>
 
@@ -670,6 +777,119 @@ function initSlider(){
   });
 }
 
+// ==================== CPU 各核温度 ====================
+// 按温度给每个核心上暖色：<45 绿、45~51 橙、>51 红
+function renderCpu(list){
+  for (let i = 0; i < 8; i++){
+    const el = document.getElementById('cpu' + i);
+    if (!el) continue;
+    const box = el.parentElement;
+    const v = list[i];
+    if (!v || v <= 0){
+      el.innerHTML = '--';
+      if (box) box.className = 'item';
+      continue;
+    }
+    const c = v / 1000;
+    el.innerHTML = c.toFixed(1) + '<small>℃</small>';
+    if (box){
+      box.className = 'item ' + (c >= 51 ? 't-hot' : c >= 45 ? 't-warm' : 't-cool');
+    }
+  }
+}
+
+// ==================== 充电温度墙 ====================
+// WALL 保存后端读到的真实状态，避免刷新时把用户正在拖的滑条盖掉
+let WALL = { on: 1, c: 51, curr: 0, batt: 0 };
+let WALL_DRAG = false;
+
+function renderWall(d){
+  if (typeof d.wall_on !== 'number') return;
+  WALL.on   = d.wall_on;
+  WALL.c    = Math.round((d.wall_c || 51000) / 1000);
+  WALL.curr = d.wall_curr || 0;
+  // 电池真实温度：优先 batt_ntc（batt_therm 独立 NTC，不受 fake_temp 影响）。
+  // 不能用 batt_drv —— battery/batt_temp 会被 fake_temp 改写成恒定 35℃。
+  WALL.batt = d.batt_ntc > 0 ? d.batt_ntc : (d.batt_real > 0 ? d.batt_real : 0);
+
+  const pill = document.getElementById('wallPill');
+  const tg   = document.getElementById('wallSwitch');
+  const rg   = document.getElementById('wallRange');
+  const val  = document.getElementById('wallVal');
+  const batt = document.getElementById('wallBatt');
+  const curr = document.getElementById('wallCurr');
+  const desc = document.getElementById('wallDesc');
+  const st   = document.getElementById('wallState');
+
+  if (pill){
+    pill.textContent = WALL.on ? '已开启' : '已关闭';
+    pill.style.color = WALL.on ? 'var(--green)' : 'var(--text2)';
+  }
+  if (tg) tg.className = 'switch' + (WALL.on ? ' on' : '');
+  if (rg && !WALL_DRAG) rg.value = WALL.c;
+  if (val) val.textContent = WALL.c;
+
+  if (batt){
+    batt.innerHTML = WALL.batt > 0
+      ? (WALL.batt/1000).toFixed(1) + '<small>℃</small>'
+      : '--<small>℃</small>';
+  }
+  if (curr){
+    const ma = Math.round(WALL.curr / 1000);
+    curr.textContent = WALL.curr > 0 ? ma + ' mA' : '--';
+    curr.className = 'v ' + (WALL.curr >= 22000000 ? 'green'
+                            : WALL.curr >= 11000000 ? 'orange' : 'red');
+  }
+  if (desc){
+    desc.textContent = WALL.on ? ('电池到 ' + WALL.c + '℃ 就限制充电电流') : '温度墙已关闭，不干预充电';
+  }
+  if (st){
+    if (!WALL.on){
+      st.textContent = '已关闭，充电电流由系统决定';
+    } else if (WALL.batt > 0 && WALL.batt >= WALL.c * 1000){
+      st.textContent = '电池已到 ' + (WALL.batt/1000).toFixed(1)
+        + '℃，正在限流；回落会自动恢复';
+    } else {
+      st.textContent = '阈值以下全速充电，超过后按档位递减';
+    }
+  }
+}
+
+// 拖动过程只更新数字，不发命令
+function onWallInput(v){
+  WALL_DRAG = true;
+  const val = document.getElementById('wallVal');
+  if (val) val.textContent = v;
+}
+
+// 松手才落盘
+async function setWall(v){
+  WALL_DRAG = false;
+  const n = parseInt(v, 10);
+  if (isNaN(n) || n < 35 || n > 60){
+    alert('温度范围 35~60℃');
+    return;
+  }
+  WALL.c = n;
+  try{
+    await sh(BIN + ' wall ' + n);
+  }catch(e){ console.error(e); }
+  setTimeout(refresh, 400);
+}
+
+async function toggleWall(){
+  const tg = document.getElementById('wallSwitch');
+  if (!tg) return;
+  // 以当前实际状态取反，不依赖 checkbox
+  const on = !WALL.on;
+  WALL.on = on ? 1 : 0;
+  tg.className = 'switch' + (on ? ' on' : '');
+  try{
+    await sh(BIN + ' wall ' + (on ? 'on' : 'off'));
+  }catch(e){ console.error(e); }
+  setTimeout(refresh, 400);
+}
+
 async function refresh(){
   try{
     const raw = await sh(BIN + ' dump');
@@ -705,21 +925,32 @@ async function refresh(){
     const pp = document.getElementById('pps');
     pp.textContent = d.pps_ptf === 1 ? '已启用' : '未启用';
     pp.className = 'v ' + (d.pps_ptf === 1 ? 'green' : '');
-    document.getElementById('sysTemp').innerHTML = (d.batt_temp/10).toFixed(1) + '<small>℃</small>';
+    document.getElementById('sysTemp').innerHTML = (d.batt_ps/10).toFixed(1) + '<small>℃</small>';
     document.getElementById('realTemp').innerHTML = (d.real_batt_temp/100).toFixed(1) + '<small>℃</small>';
-    // 注：real_batt_temp 来自 cp_master/batt_temp，单位 0.01℃
+    // 注：real_batt_temp 来自 cp_master/batt_temp（单位 0.01℃）；
+    //     batt_ps 是系统可见的 battery/temp（伪装后为假值，单位 0.1℃）
 
     // 温度对比（单位 0.001℃，除以 1000）
     const f = (v) => v > 0 ? (v/1000).toFixed(1) + '℃' : '--';
     const fk = (d.fake_val/10).toFixed(1) + '℃';
-    document.getElementById('cpuReal').textContent  = f(d.cpu_real);
+    document.getElementById('cpuReal').textContent  = d.cpu_max > 0 ? (d.cpu_max/1000).toFixed(1) + '℃' : '--';
     document.getElementById('cpuFake').textContent  = fk;
-    document.getElementById('gpuReal').textContent  = f(d.gpu_kgsl || d.gpu_real);
+    document.getElementById('gpuReal').textContent  = f(d.gpu_real);
     document.getElementById('gpuFake').textContent  = fk;
-    document.getElementById('battReal').textContent = f(d.batt_real);
+    document.getElementById('battReal').textContent = d.batt_ntc > 0
+      ? (d.batt_ntc/1000).toFixed(1) + '℃'
+      : f(d.batt_real);
     document.getElementById('battFake').textContent = fk;
     document.getElementById('chgReal').textContent  = f(d.chg_real);
     document.getElementById('chgFake').textContent  = fk;
+
+    // CPU 各核温度（cpu_list 是每核最高温数组，单位 0.001℃）
+    renderCpu(d.cpu_list || []);
+    document.getElementById('cpuMax').textContent =
+      d.cpu_max > 0 ? (d.cpu_max/1000).toFixed(1) + '℃' : '--';
+
+    // 充电温度墙
+    renderWall(d);
 
     // 电池
     document.getElementById('cap').textContent = d.capacity;

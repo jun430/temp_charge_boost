@@ -1,6 +1,6 @@
 id=temp_charge_boost
 name=温度伪装 · 充电提速
-version=v1.1.0
-versionCode=110
+version=v1.2.0
+versionCode=120
 author=雨色
-description=通过 bind mount 伪装全系统温度节点（CPU/GPU/电池/充电/基带），解除充电限流档位，并提供屏幕亮度调节。支持 KernelSU WebUI 查看状态、调节亮度与日志。
+description=通过 bind mount 伪装系统温度节点，解除充电限流并附带充电温度墙与屏幕亮度调节。支持 KernelSU WebUI 查看温度、调节阈值与日志。

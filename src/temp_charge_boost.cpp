@@ -47,13 +47,33 @@ static const char *N_PPS_PTF    = "/sys/class/xm_power/charger/quick_charge/fake
 static const char *N_BATT_TEMP  = "/sys/class/power_supply/battery/temp";
 static const char *N_USB_ONLINE = "/sys/class/power_supply/usb/online";
 static const char *N_BATT_STAT  = "/sys/class/power_supply/battery/status";
+// 温控可覆盖的充电电流上限（mi_thermald 的 thermal_fcc_override 目标节点）
+// def_target 22000000，select_higher:0，可直接写小值做限流
+static const char *N_WIRED_CURR = "/sys/class/xm_power/charger/charger_thermal/wired_chg_curr";
+
+static const int  DEF_WIRED_CURR = 22000000;  // 默认满额 22A
+static const int  WALL_CAP_CURR  = 3000000;   // 温度墙触顶时压到 3A
 
 static const int  DEF_TEMP      = 350;   // 35.0C
 static const int  POLL_CHARGING = 5;     // 充电时轮询秒
 static const int  POLL_IDLE     = 30;    // 空闲轮询秒
 
-// 排除的 zone 类型（基带中 -273 的无效传感器）
-static const char *EXCLUDE_TYPE[] = { "sdr0_pa", nullptr };
+// 排除的 zone 类型（精确匹配）
+// 基带 / 射频节点真实温度可达 83~89℃，伪装后系统读不到，风险过高，
+// 一律保留真实值，让厂商温控仍能对基带降频。
+static const char *EXCLUDE_TYPE[] = {
+    "sdr0_pa",      // 射频无效传感器（恒 -273）
+    "mdmss-0", "mdmss-1", "mdmss-2", "mdmss-3",   // 调制解调器
+    "pa_therm1", "pa_therm2",                      // 功放
+    "sdr0", "mmw_ific0",                           // 射频收发
+    nullptr
+};
+
+// 排除的 zone 类型（子串匹配，用于带后缀的同类节点）
+static const char *EXCLUDE_SUBSTR[] = {
+    "mdmss",        // 覆盖 mdmss-N 及未来变体
+    nullptr
+};
 
 // ============ 工具函数 ============
 
@@ -226,6 +246,8 @@ static bool is_mounted(const char *target) {
 static bool excluded_type(const std::string &t) {
     for (int i = 0; EXCLUDE_TYPE[i]; i++)
         if (t == EXCLUDE_TYPE[i]) return true;
+    for (int i = 0; EXCLUDE_SUBSTR[i]; i++)
+        if (t.find(EXCLUDE_SUBSTR[i]) != std::string::npos) return true;
     return false;
 }
 
@@ -241,12 +263,53 @@ static void ensure_dir(const char *p) {
     mkdir(p, 0755);
 }
 
+// ============ 按 type 名查找 zone（替代硬编码编号）============
+// 硬编码 zone 编号在不同固件/内核版本下会错位，按 type 名查找才可靠。
+
+// 精确匹配 type，返回 zone 编号；找不到返回 -1
+static long zone_by_type(const char *type) {
+    DIR *d = opendir(ZONE_ROOT);
+    if (!d) return -1;
+    struct dirent *e;
+    long found = -1;
+    while ((e = readdir(d))) {
+        if (strncmp(e->d_name, "thermal_zone", 12) != 0) continue;
+        std::string tp = std::string(ZONE_ROOT) + "/" + e->d_name + "/type";
+        std::string t;
+        if (!read_str(tp.c_str(), t)) continue;
+        if (t == type) { found = atol(e->d_name + 12); break; }
+    }
+    closedir(d);
+    return found;
+}
+
+// 按 type 前缀收集 zone 编号，返回数量
+static int zones_by_prefix(const char *prefix, long *out, int maxn) {
+    DIR *d = opendir(ZONE_ROOT);
+    if (!d) return 0;
+    struct dirent *e;
+    int n = 0;
+    size_t pl = strlen(prefix);
+    while ((e = readdir(d)) && n < maxn) {
+        if (strncmp(e->d_name, "thermal_zone", 12) != 0) continue;
+        std::string tp = std::string(ZONE_ROOT) + "/" + e->d_name + "/type";
+        std::string t;
+        if (!read_str(tp.c_str(), t)) continue;
+        if (t.size() >= pl && t.compare(0, pl, prefix) == 0)
+            out[n++] = atol(e->d_name + 12);
+    }
+    closedir(d);
+    return n;
+}
+
+
 // ============ 温度伪装 ============
 
 // 前向声明（定义见下方持久 fd 区）
 static void open_real_fds();
 static void close_real_fds();
 static void flush_real_values();
+static int  read_live_real(long zn);
 
 static int apply_temp(int want) {
     ensure_dir(WORK_DIR);
@@ -622,6 +685,120 @@ static void charge_tick() {
     }
 }
 
+// ============ 充电温度墙 ============
+// 背景：系统自带充电温度墙在 [CLASS0-SIC-BAT]（/data/vendor/thermal/decrypt.txt），
+// 但它只是 mi_thermald 解析加密 thermal-map.conf 后的只读快照，改文件不生效。
+// 因此由本模块自己实现闭环：读电池真实温度 → 按档位写 wired_chg_curr 限制充电电流。
+//
+// 为什么用 wired_chg_curr：它是 mi_thermald 的 thermal_fcc_override 目标节点
+// （thermald-devices.conf 里 def_target:22000000、select_higher:0），
+// 写入小值即被系统当作电流上限采纳，实测写 3000000 可稳定保持不回退。
+//
+// 档位设计：以 wall_c 为阈值，超温越限越狠；回落到 wall_c - 3℃ 才放宽，
+// 3℃ 滞回避免在阈值附近反复抖动。基带节点不伪装，因此基带温控仍由系统负责。
+
+// 读取电池真实温度（0.001℃）。
+//
+// 关键坑：batt_therm / battery / batt_temp 三者里，只有 batt_therm 是独立 NTC。
+// battery(zone67) 与 batt_temp(zone70) 的驱动值会被 fake_temp 直接改写，
+// 一旦本模块写入 fake_temp=350，它们就恒定返回 35℃，读不到真实温升，
+// 拿它们做温度墙判断会导致「电池烧到 60℃ 也不触发」。
+// 因此优先 batt_therm，其余仅作降级。
+static int wall_real_batt_temp() {
+    static const char *BATT_TYPES[] = { "batt_therm", "battery", "batt_temp", nullptr };
+    // ① 持久 fd 实时值（daemon 内有效）
+    for (int i = 0; BATT_TYPES[i]; i++) {
+        long z = zone_by_type(BATT_TYPES[i]);
+        if (z < 0) continue;
+        int v = read_live_real(z);
+        if (v > 0) return v;
+    }
+    // ② 新鲜快照（dump 等独立进程）
+    for (int i = 0; BATT_TYPES[i]; i++) {
+        long z = zone_by_type(BATT_TYPES[i]);
+        if (z < 0) continue;
+        char p[256];
+        snprintf(p, sizeof(p), "%s/thermal_zone%ld", REAL_DIR, z);
+        struct stat st;
+        if (stat(p, &st) == 0) {
+            long age = (long)time(nullptr) - (long)st.st_mtime;
+            if (age >= 0 && age <= 120) {
+                int v = 0;
+                if (read_int(p, &v) && v > 0) return v;
+            }
+        }
+    }
+    // ③ 最后回退：X7_therm 是未伪装的主板温度传感器
+    long z = zone_by_type("X7_therm");
+    if (z >= 0) {
+        int v = read_live_real(z);
+        if (v > 0) return v;
+    }
+    return 0;
+}
+
+// 计算目标电流上限（µA）。wall_c 单位 0.001℃，cap 为满额值。
+// 返回 0 表示不干预（交由系统默认）。
+static int wall_target_curr(int batt_c, int wall_c, int cap) {
+    if (batt_c <= 0) return 0;
+    // 滞回：未超阈值时给满额，让系统自己决定
+    if (batt_c < wall_c)      return 0;
+    if (batt_c < wall_c + 2000)   return cap * 80 / 100;   // 阈值 ~ +2℃
+    if (batt_c < wall_c + 4000)   return cap * 50 / 100;   // +2 ~ +4℃
+    if (batt_c < wall_c + 6000)   return cap * 25 / 100;   // +4 ~ +6℃
+    return cap * 12 / 100;                                 // 超过 +6℃
+}
+
+// 每轮调用：充电时执行温度墙判定，必要时写上限；降温后恢复
+// 配置从 wall.conf 读取（"启用 阈值x10" 两字段），WebUI 改完即时生效
+static void wall_tick() {
+    // 读配置：enabled wall_c
+    int enabled = 1, wall_c = 51000;
+    {
+        char p[192];
+        snprintf(p, sizeof(p), "%s/wall.conf", WORK_DIR);
+        FILE *fp = fopen(p, "r");
+        if (fp) {
+            if (fscanf(fp, "%d %d", &enabled, &wall_c) != 2) {
+                enabled = 1; wall_c = 51000;
+            }
+            fclose(fp);
+        }
+    }
+
+    int cap = DEF_WIRED_CURR;
+    int wc = 0;
+    read_int(N_WIRED_CURR, &wc);
+
+    if (!enabled || wall_c <= 0) {
+        // 温度墙关闭：若曾被压低，恢复满额
+        if (wc > 0 && wc < cap) {
+            write_int(N_WIRED_CURR, cap);
+            logf("温度墙关闭，恢复充电电流 %d", cap);
+        }
+        return;
+    }
+
+    int bt = wall_real_batt_temp();
+    int want = wall_target_curr(bt, wall_c, cap);
+    if (want == 0) {
+        // 未超阈值：仅在之前被压低时恢复
+        if (wc > 0 && wc < cap) {
+            write_int(N_WIRED_CURR, cap);
+            logf("电池 %d.%d℃ 已回落，恢复充电电流 %d",
+                 bt / 1000, (bt % 1000) / 100, cap);
+        }
+        return;
+    }
+    // 只在明显需要下调时写，避免频繁抖动
+    if (wc <= 0 || wc > want + 200000) {
+        write_int(N_WIRED_CURR, want);
+        logf("温度墙: 电池 %d.%d℃ ≥ %d.%d℃，充电电流上限 %d -> %d",
+             bt / 1000, (bt % 1000) / 100,
+             wall_c / 1000, (wall_c % 1000) / 100, wc, want);
+    }
+}
+
 // ============ daemon ============
 
 static void run_daemon() {
@@ -647,10 +824,8 @@ static void run_daemon() {
 
     bool last_chg = false;
     int tick = 0;
-    long last_bl = 0;
-    // 开机后立刻把用户设定的亮度落一次（settings 可能被系统重置）
-    bl_tick();
-    last_bl = (long)time(nullptr);
+    // 亮度：不再自动纠正。亮度完全由用户自己调（WebUI 或 bright 命令），
+    // daemon 不参与，避免与用户手动调节冲突导致屏幕忽明忽暗。
     for (;;) {
         bool chg = is_charging();
         if (chg != last_chg) {
@@ -659,18 +834,14 @@ static void run_daemon() {
         }
         if (chg) {
             charge_tick();
+            wall_tick();           // 充电温度墙（读 wall.conf 实时生效）
             flush_real_values();   // 充电时每次都刷新真实温度
             sleep(POLL_CHARGING);
         } else {
             // 空闲时也定期刷新（每 30 秒）
+            wall_tick();           // 不在充电也要跑：上次充电压低后需恢复
             flush_real_values();
             sleep(POLL_IDLE);
-        }
-        // 亮度纠正：每 60 秒最多一次（与充电节奏解耦，避免频繁 fork settings）
-        long now = (long)time(nullptr);
-        if (now - last_bl >= 60) {
-            bl_tick();
-            last_bl = now;
         }
         tick++;
     }
@@ -755,10 +926,106 @@ static int read_live_real(long zn) {
     return atoi(b);
 }
 
+// 读真实温度（三级回退）：
+// ① 持久 fd 实时值（仅 daemon 进程内有效，最准确）
+// ② REAL_DIR 快照（daemon 写，供 dump 等独立进程跨进程读取；有新鲜度门限）
+// ③ 直接读 sysfs（daemon 未运行时；若已伪装则为伪装值，但优于返回 0）
+//
+// 新鲜度门限的意义：REAL_DIR 是磁盘文件，daemon 停掉后仍保留上次写的值。
+// 若不加限制，旧快照会盖住 sysfs 的真实读数（实测出现过 98℃ vs 43℃ 的错乱）。
+// 因此只接受 120 秒内写过的快照。
+static int read_best(long zn) {
+    int v = read_live_real(zn);
+    if (v > 0) return v;
+    char p[256];
+    snprintf(p, sizeof(p), "%s/thermal_zone%ld", REAL_DIR, zn);
+    struct stat st;
+    if (stat(p, &st) == 0) {
+        long age = (long)time(nullptr) - (long)st.st_mtime;
+        if (age >= 0 && age <= 120 && read_int(p, &v) && v > 0) return v;
+    }
+    snprintf(p, sizeof(p), "%s/thermal_zone%ld/temp", ZONE_ROOT, zn);
+    if (read_int(p, &v) && v > 0) return v;
+    return 0;
+}
+
+// CPU 每核温度：按 type 的 cpu-<cluster>-<core>-<sensor> 聚合，
+// 同一核的多个传感器取最大值。返回核数，out 为每核温度（0.001℃）。
+// 这样输出的是「8 个核」而不是「16 个传感器」，符合直觉。
+static int cpu_core_temps(int *out, int maxn) {
+    long zs[64];
+    int  keys[64];
+    int  zn = 0;
+    DIR *d = opendir(ZONE_ROOT);
+    if (!d) return 0;
+    struct dirent *e;
+    while ((e = readdir(d)) && zn < 64) {
+        if (strncmp(e->d_name, "thermal_zone", 12) != 0) continue;
+        std::string tp = std::string(ZONE_ROOT) + "/" + e->d_name + "/type";
+        std::string t;
+        if (!read_str(tp.c_str(), t)) continue;
+        int a = -1, b = -1;
+        // 只接受 cpu-N-M-* 形式，自动排除 cpu-hw-trip-N / cpu_therm
+        if (sscanf(t.c_str(), "cpu-%d-%d-", &a, &b) != 2) continue;
+        keys[zn] = a * 100 + b;
+        zs[zn]   = atol(e->d_name + 12);
+        zn++;
+    }
+    closedir(d);
+
+    // 去重 + 按 (cluster, core) 升序
+    int uk[64], un = 0;
+    for (int i = 0; i < zn; i++) {
+        bool dup = false;
+        for (int k = 0; k < un; k++) if (uk[k] == keys[i]) { dup = true; break; }
+        if (!dup && un < 64) uk[un++] = keys[i];
+    }
+    for (int i = 0; i < un; i++)
+        for (int k = i + 1; k < un; k++)
+            if (uk[k] < uk[i]) { int t = uk[i]; uk[i] = uk[k]; uk[k] = t; }
+
+    int n = 0;
+    for (int i = 0; i < un && n < maxn; i++) {
+        int mx = 0;
+        for (int k = 0; k < zn; k++) {
+            if (keys[k] != uk[i]) continue;
+            int v = read_best(zs[k]);
+            if (v > mx) mx = v;
+        }
+        out[n++] = mx;
+    }
+    return n;
+}
+
 // 把所有关键 zone 的实时真实值写入 REAL_DIR（供 WebUI 跨进程读取）
+// 缓冲区按最多的场景预留：CPU 8 + GPU 11 + 电池/充电若干
 static void flush_real_values() {
-    static const long KEY_ZONES[] = { 0, 36, 68, 70, 84 };
-    for (long zn : KEY_ZONES) {
+    long zones[64];
+    int n = 0;
+
+    // CPU：cpu-0-x / cpu-1-x（真实核心温度，不带 hw-trip）
+    long tmp[64];
+    int m = zones_by_prefix("cpu-0-", tmp, 64);
+    for (int i = 0; i < m && n < 64; i++) zones[n++] = tmp[i];
+    m = zones_by_prefix("cpu-1-", tmp, 64);
+    for (int i = 0; i < m && n < 64; i++) zones[n++] = tmp[i];
+    // GPU：gpuss-*
+    m = zones_by_prefix("gpuss-", tmp, 64);
+    for (int i = 0; i < m && n < 64; i++) zones[n++] = tmp[i];
+    // 电池 / 充电口 / 主板（按 type 名查，不硬编码编号）
+    static const char *SINGLE[] = {
+        "battery", "batt_temp", "batt_therm",
+        "charger_therm", "conn_therm", "conn_therm2",
+        "xoagg_therm", "cpullc-0-0", "X7_therm",
+        nullptr
+    };
+    for (int i = 0; SINGLE[i]; i++) {
+        long z = zone_by_type(SINGLE[i]);
+        if (z >= 0 && n < 64) zones[n++] = z;
+    }
+
+    for (int i = 0; i < n; i++) {
+        long zn = zones[i];
         int v = read_live_real(zn);
         if (v <= 0) continue;
         char p[256];
@@ -766,8 +1033,8 @@ static void flush_real_values() {
         int fd = open(p, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
         if (fd < 0) continue;
         char b[16];
-        int n = snprintf(b, sizeof(b), "%d\n", v);
-        ssize_t w = write(fd, b, n); (void)w;
+        int k = snprintf(b, sizeof(b), "%d\n", v);
+        ssize_t w = write(fd, b, k); (void)w;
         close(fd);
     }
 }
@@ -825,26 +1092,69 @@ static void dump_json() {
     read_int(N_CTRL_LIMIT, &cl);
     read_int(N_PPS_PTF, &pp);
 
-    // 真实温度：读电荷泵自带 NTC（cp_master/batt_temp，未被 mount 影响，单位 0.01℃）
+    // 真实温度：优先读电荷泵自带 NTC（cp_master/batt_temp，单位 0.01℃）
+    // 但电荷泵停工时该节点会返回陈旧值（实测卡死 6400），
+    // 判据：ibus 接近 0（未在充放电）或值异常时，回退到 charger_therm 真实值。
     int real_bt = 0;
     {
         read_int("/sys/class/xm_power/cp_master/batt_temp", &real_bt);
-        if (real_bt <= 0) {
-            // 回退：PMIC 温度
-            char p[256];
-            snprintf(p, sizeof(p), "%s/thermal_zone86/temp", ZONE_ROOT);
-            read_int(p, &real_bt);
+        int cp_ibus = 0;
+        read_int("/sys/class/xm_power/cp_master/ibus", &cp_ibus);
+        bool cp_idle = (cp_ibus <= 10);
+        if (cp_idle || real_bt <= 0 || real_bt > 10000) {
+            long z72 = zone_by_type("charger_therm");
+            int v = (z72 >= 0) ? read_live_real(z72) : 0;
+            if (v <= 0 && z72 >= 0) {
+                char p[256];
+                snprintf(p, sizeof(p), "%s/thermal_zone%ld/temp", ZONE_ROOT, z72);
+                read_int(p, &v);
+            }
+            if (v > 0) real_bt = v / 10;   // 0.001℃ -> 0.01℃，与 cp_master 同刻度
         }
     }
 
-    // === 关键指标：真实 vs 伪装（真实值由 daemon 写入 REAL_DIR）===
-    int cpu_real      = read_real("thermal_zone0");    // cpullc-0-0
-    int cpu_therm_real= read_real("thermal_zone70");   // cpu_therm
-    int gpu_real      = read_real("thermal_zone36");   // gpuss-0
-    int gpu_kgsl      = 0;
+    // === 关键指标：真实温度（全部按 type 名查找，不硬编码编号）===
+    // CPU：按 cpu-<cluster>-<core> 聚合为每核最高温，输出 8 个核
+    int cpu_vals[32];
+    int cpu_cnt = cpu_core_temps(cpu_vals, 32);
+    // GPU：gpuss-* 取最高温（用户要求只显示一个 GPU 温度）
+    int gpu_real = 0;
+    {
+        long tmp[32];
+        int m = zones_by_prefix("gpuss-", tmp, 32);
+        for (int i = 0; i < m; i++) {
+            int v = read_best(tmp[i]);
+            if (v > gpu_real) gpu_real = v;
+        }
+    }
+    int cpu_therm_real = 0;
+    {
+        long z = zone_by_type("cpu_therm");
+        if (z >= 0) cpu_therm_real = read_best(z);
+    }
+    int gpu_kgsl = 0;
     read_int("/sys/class/kgsl/kgsl-3d0/temp", &gpu_kgsl);
-    int batt_real     = read_real("thermal_zone84");   // batt_therm
-    int chg_real      = read_real("thermal_zone68");   // charger_therm
+    // 电池 / 充电口：按 type 名查找
+    // batt_real 取 batt_therm（独立 NTC，不受 fake_temp 影响）
+    int batt_real = 0, chg_real = 0, conn_real = 0;
+    {
+        long z = zone_by_type("batt_therm");
+        if (z >= 0) batt_real = read_best(z);
+        z = zone_by_type("charger_therm");
+        if (z >= 0) chg_real = read_best(z);
+        z = zone_by_type("conn_therm");
+        if (z >= 0) conn_real = read_best(z);
+    }
+    // 电池组：batt_therm 是独立 NTC（真实）；battery/batt_temp 会被 fake_temp 改写。
+    // 因此 batt_real 取 batt_therm，batt_drv 只作参考。
+    int batt_ps = 0, batt_drv = 0, batt_ntc = 0;
+    read_int(N_BATT_TEMP, &batt_ps);
+    {
+        long z = zone_by_type("batt_therm");
+        if (z >= 0) batt_ntc = read_best(z);
+        z = zone_by_type("batt_temp");
+        if (z >= 0) batt_drv = read_best(z);
+    }
 
     // 充电功率
     int usb_v = 0, usb_i = 0, bat_v = 0, bat_i = 0;
@@ -890,13 +1200,38 @@ static void dump_json() {
     printf("\"status\":\"%s\",", status.c_str());
     printf("\"charging\":%s,", is_charging() ? "true" : "false");
     printf("\"daemon_alive\":%s,", daemon_alive ? "true" : "false");
-    // 真实 vs 伪装对比（单位 0.001℃，除以 1000 得 ℃）
-    printf("\"cpu_real\":%d,", cpu_real);
+    // 真实温度（单位 0.001℃，除以 1000 得 ℃）
+    // CPU 每核数组：cpu_list 按 zone 升序（cpu-0-* 在前，即超大核在前）
+    printf("\"cpu_list\":[");
+    for (int i = 0; i < cpu_cnt; i++)
+        printf("%s%d", i ? "," : "", cpu_vals[i]);
+    printf("],");
+    int cpu_max = 0;
+    for (int i = 0; i < cpu_cnt; i++) if (cpu_vals[i] > cpu_max) cpu_max = cpu_vals[i];
+    printf("\"cpu_max\":%d,", cpu_max);
+    printf("\"cpu_real\":%d,", cpu_cnt > 0 ? cpu_vals[0] : 0);
     printf("\"cpu_therm_real\":%d,", cpu_therm_real);
     printf("\"gpu_real\":%d,", gpu_real);
     printf("\"gpu_kgsl\":%d,", gpu_kgsl);
     printf("\"batt_real\":%d,", batt_real);
+    printf("\"batt_ps\":%d,", batt_ps);
+    printf("\"batt_drv\":%d,", batt_drv);
+    printf("\"batt_ntc\":%d,", batt_ntc);
     printf("\"chg_real\":%d,", chg_real);
+    printf("\"conn_real\":%d,", conn_real);
+    // === 充电温度墙状态 ===
+    {
+        int we = 1, wc2 = 51000;
+        char p[192];
+        snprintf(p, sizeof(p), "%s/wall.conf", WORK_DIR);
+        FILE *fp = fopen(p, "r");
+        if (fp) { if (fscanf(fp, "%d %d", &we, &wc2) != 2) { we = 1; wc2 = 51000; } fclose(fp); }
+        int wcur = 0;
+        read_int(N_WIRED_CURR, &wcur);
+        printf("\"wall_on\":%d,", we);
+        printf("\"wall_c\":%d,", wc2);
+        printf("\"wall_curr\":%d,", wcur);
+    }
     // === 屏幕亮度 ===
     // 面板发现失败时 ok=false，WebUI 据此隐藏亮度 tab
     {
@@ -964,6 +1299,50 @@ int main(int argc, char **argv) {
         printf("{\"ok\":%s,\"pct\":%d,\"raw\":%d}\n", ok ? "true" : "false", pct, bl_cur_raw());
         return ok ? 0 : 1;
     }
+    else if (!strcmp(cmd, "wall")) {
+        // wall                → 打印温度墙状态
+        // wall <30-60>        → 设阈值（℃）
+        // wall on|off         → 开关
+        const char *a2 = argc > 2 ? argv[2] : NULL;
+        char p[192];
+        snprintf(p, sizeof(p), "%s/wall.conf", WORK_DIR);
+        int we = 1, wc = 51000;
+        {
+            FILE *fp = fopen(p, "r");
+            if (fp) { if (fscanf(fp, "%d %d", &we, &wc) != 2) { we = 1; wc = 51000; } fclose(fp); }
+        }
+        if (a2) {
+            if (!strcmp(a2, "on"))       we = 1;
+            else if (!strcmp(a2, "off")) we = 0;
+            else {
+                int c = atoi(a2);
+                if (c < 30 || c > 60) { printf("{\"ok\":false,\"why\":\"range\"}\n"); return 1; }
+                wc = c * 1000;
+                we = 1;
+            }
+            ensure_dir(WORK_DIR);
+            FILE *fp = fopen(p, "w");
+            if (fp) { fprintf(fp, "%d %d\n", we, wc); fclose(fp); }
+            logf("温度墙: %s, 阈值 %d℃", we ? "开启" : "关闭", wc / 1000);
+            // 关闭时立刻恢复电流，不等下一轮
+            if (!we) {
+                int cur = 0;
+                if (read_int(N_WIRED_CURR, &cur) && cur > 0 && cur < DEF_WIRED_CURR)
+                    write_int(N_WIRED_CURR, DEF_WIRED_CURR);
+            }
+        }
+        int wall_curr = 0;
+        read_int(N_WIRED_CURR, &wall_curr);
+        int bt = 0;
+        {
+            long z = zone_by_type("battery");
+            if (z >= 0) bt = read_live_real(z);
+            if (bt <= 0) read_int(N_BATT_TEMP, &bt);
+        }
+        printf("{\"ok\":true,\"wall_on\":%d,\"wall_c\":%d,\"batt_temp\":%d,\"curr\":%d}\n",
+               we, wc, bt, wall_curr);
+        return 0;
+    }
     else if (!strcmp(cmd, "log")) {
         // 输出日志尾部
         int nl = argc > 2 ? atoi(argv[2]) : 50;
@@ -981,7 +1360,7 @@ int main(int argc, char **argv) {
         }
     }
     else {
-        fprintf(stderr, "用法: %s {daemon|apply [温度x10]|restore|status|dump|bright [1-100|auto on|off]|log [行数]}\n", argv[0]);
+        fprintf(stderr, "用法: %s {daemon|apply [温度x10]|restore|status|dump|bright [1-100|auto on|off]|wall [30-60|on|off]|log [行数]}\n", argv[0]);
         return 1;
     }
     return 0;
