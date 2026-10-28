@@ -1,0 +1,844 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<title>温度伪装 · 充电提速</title>
+<style>
+:root{
+  --bg:#f4f5f7; --card:rgba(255,255,255,.72); --card-solid:#fff;
+  --text:#1c1c1e; --text2:#8e8e93; --line:rgba(0,0,0,.07);
+  --accent:#0a84ff; --green:#30d158; --orange:#ff9f0a; --red:#ff3b30;
+  --shadow:0 2px 16px rgba(0,0,0,.06); --radius:18px;
+  --glass:blur(20px) saturate(180%);
+}
+@media(prefers-color-scheme:dark){
+  :root{
+    --bg:#000; --card:rgba(28,28,30,.72); --card-solid:#1c1c1e;
+    --text:#f2f2f7; --text2:#8e8e93; --line:rgba(255,255,255,.09);
+    --accent:#0a84ff; --green:#30d158; --orange:#ff9f0a; --red:#ff453a;
+    --shadow:0 2px 20px rgba(0,0,0,.4);
+  }
+}
+*{margin:0;padding:0;box-sizing:border-box;-webkit-tap-highlight-color:transparent}
+body{
+  font-family:-apple-system,BlinkMacSystemFont,"SF Pro SC","PingFang SC","Helvetica Neue",sans-serif;
+  background:var(--bg); color:var(--text); min-height:100vh;
+  padding:env(safe-area-inset-top) 16px calc(env(safe-area-inset-bottom) + 24px);
+  font-size:15px; line-height:1.45; -webkit-font-smoothing:antialiased;
+  transition:background .3s,color .3s;
+}
+.wrap{max-width:520px;margin:0 auto}
+
+/* 顶栏 */
+header{
+  padding:24px 4px 18px;display:flex;align-items:center;justify-content:space-between;
+}
+h1{font-size:26px;font-weight:700;letter-spacing:-.5px}
+.sub{font-size:13px;color:var(--text2);margin-top:2px}
+.pill{
+  font-size:12px;font-weight:600;padding:6px 12px;border-radius:100px;
+  background:var(--card);backdrop-filter:var(--glass);-webkit-backdrop-filter:var(--glass);
+  border:1px solid var(--line);display:flex;align-items:center;gap:6px;
+}
+.dot{width:7px;height:7px;border-radius:50%;background:var(--text2)}
+.dot.on{background:var(--green);box-shadow:0 0 8px var(--green)}
+.dot.off{background:var(--red)}
+
+/* 卡片 */
+.card{
+  background:var(--card); backdrop-filter:var(--glass); -webkit-backdrop-filter:var(--glass);
+  border:1px solid var(--line); border-radius:var(--radius);
+  box-shadow:var(--shadow); padding:18px; margin-bottom:14px;
+  transition:transform .18s cubic-bezier(.4,0,.2,1),box-shadow .18s;
+}
+.card:active{transform:scale(.985)}
+.card-title{
+  font-size:13px;font-weight:600;color:var(--text2);text-transform:uppercase;
+  letter-spacing:.5px;margin-bottom:14px;display:flex;align-items:center;gap:7px;
+}
+.card-title svg{width:15px;height:15px;opacity:.7}
+
+/* 大数字 */
+.hero{display:flex;align-items:baseline;gap:10px;margin-bottom:4px}
+.hero-num{font-size:46px;font-weight:700;letter-spacing:-2px;line-height:1;
+  font-variant-numeric:tabular-nums}
+.hero-unit{font-size:17px;font-weight:600;color:var(--text2)}
+.hero-hint{font-size:13px;color:var(--text2);margin-top:6px}
+
+/* 网格 */
+.grid{display:grid;grid-template-columns:1fr 1fr;gap:11px}
+.grid3{display:grid;grid-template-columns:repeat(3,1fr);gap:11px}
+.item{
+  background:var(--card-solid); border-radius:13px; padding:13px;
+  border:1px solid var(--line);
+}
+.item .k{font-size:11.5px;color:var(--text2);margin-bottom:5px;font-weight:500}
+.item .v{font-size:19px;font-weight:650;font-variant-numeric:tabular-nums;letter-spacing:-.3px}
+.item .v small{font-size:12px;font-weight:500;color:var(--text2);margin-left:2px}
+.v.green{color:var(--green)} .v.orange{color:var(--orange)} .v.red{color:var(--red)} .v.accent{color:var(--accent)}
+
+/* 进度条 */
+.bar{height:6px;background:var(--line);border-radius:100px;overflow:hidden;margin-top:10px}
+.bar-fill{height:100%;border-radius:100px;background:linear-gradient(90deg,var(--accent),#5ac8fa);
+  transition:width .5s cubic-bezier(.4,0,.2,1)}
+
+/* 开关列表 */
+.row{
+  display:flex;align-items:center;justify-content:space-between;
+  padding:13px 0;border-bottom:1px solid var(--line);
+}
+.row:last-child{border-bottom:none;padding-bottom:0}
+.row:first-of-type{padding-top:0}
+.row-l{display:flex;align-items:center;gap:11px;flex:1;min-width:0}
+.row-ico{
+  width:34px;height:34px;border-radius:9px;display:flex;align-items:center;justify-content:center;
+  flex-shrink:0;background:var(--line);
+}
+.row-ico svg{width:17px;height:17px}
+.row-t{font-size:14.5px;font-weight:550;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.row-d{font-size:11.5px;color:var(--text2);margin-top:1px}
+
+/* 按钮 */
+.btns{display:grid;grid-template-columns:1fr 1fr;gap:11px;margin-bottom:14px}
+.btn{
+  padding:15px;border-radius:15px;border:none;font-size:15px;font-weight:600;
+  font-family:inherit;cursor:pointer;transition:all .16s;
+  display:flex;align-items:center;justify-content:center;gap:7px;
+}
+.btn:active{transform:scale(.96)}
+.btn-primary{background:var(--accent);color:#fff;box-shadow:0 4px 14px rgba(10,132,255,.3)}
+.btn-danger{background:var(--red);color:#fff;box-shadow:0 4px 14px rgba(255,59,48,.25)}
+.btn-ghost{background:var(--card-solid);color:var(--text);border:1px solid var(--line)}
+.btn svg{width:17px;height:17px}
+
+/* 日志 */
+.log-box{
+  background:var(--card-solid); border:1px solid var(--line); border-radius:13px;
+  padding:13px; max-height:300px; overflow-y:auto;
+  font-family:ui-monospace,"SF Mono",Menlo,monospace; font-size:11.5px; line-height:1.65;
+  color:var(--text2); white-space:pre-wrap; word-break:break-all;
+}
+.log-box::-webkit-scrollbar{width:4px}
+.log-box::-webkit-scrollbar-thumb{background:var(--line);border-radius:10px}
+.log-line{padding:1px 0}
+.log-line.hl{color:var(--accent)}
+
+/* 底部 */
+footer{text-align:center;font-size:11.5px;color:var(--text2);padding:14px 0 4px;opacity:.7}
+
+/* ===== Tab 切换 ===== */
+.tabs{
+  display:flex;gap:4px;padding:4px;margin:0 0 16px;
+  background:var(--card);backdrop-filter:var(--glass);-webkit-backdrop-filter:var(--glass);
+  border:1px solid var(--line);border-radius:15px;box-shadow:var(--shadow);
+  position:sticky;top:env(safe-area-inset-top);z-index:20;
+}
+.tab{
+  flex:1;padding:10px 8px;border-radius:11px;border:none;background:none;
+  font-family:inherit;font-size:13.5px;font-weight:600;color:var(--text2);
+  cursor:pointer;transition:all .22s cubic-bezier(.4,0,.2,1);
+  display:flex;align-items:center;justify-content:center;gap:6px;
+}
+.tab svg{width:15px;height:15px;opacity:.85}
+.tab.active{
+  background:var(--card-solid);color:var(--text);
+  box-shadow:0 1px 6px rgba(0,0,0,.08);
+}
+@media(prefers-color-scheme:dark){
+  .tab.active{background:rgba(255,255,255,.1);box-shadow:none}
+}
+.panel{display:none}
+.panel.active{display:block;animation:fd .26s ease}
+
+/* ===== 亮度滑条 ===== */
+.slider-wrap{padding:4px 0 2px}
+.slider{
+  -webkit-appearance:none;appearance:none;width:100%;height:34px;background:none;
+  cursor:pointer;touch-action:pan-y;
+}
+.slider::-webkit-slider-runnable-track{
+  height:8px;border-radius:100px;
+  background:linear-gradient(90deg,var(--accent) 0%,var(--accent) var(--fill,50%),var(--line) var(--fill,50%),var(--line) 100%);
+}
+.slider::-webkit-slider-thumb{
+  -webkit-appearance:none;appearance:none;width:26px;height:26px;border-radius:50%;
+  background:#fff;border:1px solid rgba(0,0,0,.08);margin-top:-9px;
+  box-shadow:0 2px 8px rgba(0,0,0,.2);transition:transform .12s;
+}
+.slider:active::-webkit-slider-thumb{transform:scale(1.12)}
+.slider-ends{display:flex;justify-content:space-between;font-size:11px;color:var(--text2);margin-top:2px}
+
+/* 亮度预设按钮 */
+.presets{display:grid;grid-template-columns:repeat(4,1fr);gap:8px;margin-top:14px}
+.preset{
+  padding:11px 4px;border-radius:12px;border:1px solid var(--line);
+  background:var(--card-solid);font-family:inherit;font-size:12.5px;font-weight:600;
+  color:var(--text);cursor:pointer;transition:all .16s;
+}
+.preset:active{transform:scale(.95)}
+.preset.cur{border-color:var(--accent);color:var(--accent)}
+
+/* 开关（自动亮度） */
+.switch{
+  position:relative;width:50px;height:30px;border-radius:100px;flex-shrink:0;
+  background:var(--line);border:none;cursor:pointer;transition:background .22s;
+  padding:0;
+}
+.switch::after{
+  content:'';position:absolute;top:3px;left:3px;width:24px;height:24px;border-radius:50%;
+  background:#fff;box-shadow:0 2px 5px rgba(0,0,0,.2);transition:transform .22s cubic-bezier(.4,0,.2,1);
+}
+.switch.on{background:var(--green)}
+.switch.on::after{transform:translateX(20px)}
+
+/* 加载动画 */
+.spin{animation:sp .9s linear infinite}
+@keyframes sp{to{transform:rotate(360deg)}}
+.fade{animation:fd .28s ease}
+@keyframes fd{from{opacity:0;transform:translateY(5px)}to{opacity:1;transform:none}}
+
+/* toast */
+#toast{
+  position:fixed;bottom:calc(env(safe-area-inset-bottom) + 26px);left:50%;
+  transform:translateX(-50%) translateY(80px);
+  background:var(--text);color:var(--bg);padding:11px 20px;border-radius:100px;
+  font-size:13.5px;font-weight:550;opacity:0;transition:all .28s cubic-bezier(.4,0,.2,1);
+  pointer-events:none;z-index:999;box-shadow:0 6px 24px rgba(0,0,0,.25);
+}
+#toast.show{transform:translateX(-50%) translateY(0);opacity:1}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <div>
+      <h1>温度伪装</h1>
+      <div class="sub">充电提速 · HyperOS</div>
+    </div>
+    <div class="pill"><span class="dot" id="dot"></span><span id="pillText">连接中</span></div>
+  </header>
+
+  <!-- Tab 切换 -->
+  <div class="tabs" id="tabs">
+    <button class="tab active" data-tab="main" onclick="switchTab('main')">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M13 2L3 14h8l-1 8 10-12h-8l1-8z"/></svg>
+      充电
+    </button>
+    <button class="tab" data-tab="screen" id="tabScreen" onclick="switchTab('screen')">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="4"/><path d="M12 2v2m0 16v2M2 12h2m16 0h2M4.9 4.9l1.4 1.4m11.4 11.4l1.4 1.4M19.1 4.9l-1.4 1.4M6.3 17.7l-1.4 1.4"/></svg>
+      屏幕
+    </button>
+  </div>
+
+  <!-- ==================== 充电面板 ==================== -->
+  <div class="panel active" id="panelMain">
+
+  <div class="card fade" id="powerCard">
+    <div class="card-title">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M13 2L3 14h8l-1 8 10-12h-8l1-8z"/></svg>
+      实时充电功率
+    </div>
+    <div class="hero">
+      <div class="hero-num" id="power">--</div>
+      <div class="hero-unit">W</div>
+    </div>
+    <div class="hero-hint" id="powerHint">等待数据…</div>
+    <div class="grid" style="margin-top:16px">
+      <div class="item">
+        <div class="k">电池电压</div>
+        <div class="v" id="batV">--<small>V</small></div>
+      </div>
+      <div class="item">
+        <div class="k">电池电流</div>
+        <div class="v" id="batI">--<small>mA</small></div>
+      </div>
+    </div>
+  </div>
+
+  <!-- 伪装状态 -->
+  <div class="card fade">
+    <div class="card-title">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 2v20M2 12h20"/></svg>
+      伪装状态
+    </div>
+    <div class="grid3">
+      <div class="item">
+        <div class="k">伪装节点</div>
+        <div class="v accent" id="mounted">--</div>
+      </div>
+      <div class="item">
+        <div class="k">伪装温度</div>
+        <div class="v green" id="fakeTemp">--<small>℃</small></div>
+      </div>
+      <div class="item">
+        <div class="k">限制档位</div>
+        <div class="v" id="ctrlLimit">--</div>
+      </div>
+    </div>
+    <div class="grid" style="margin-top:11px">
+      <div class="item">
+        <div class="k">PPS 高压档</div>
+        <div class="v" id="pps">--</div>
+      </div>
+      <div class="item">
+        <div class="k">系统读到的温度</div>
+        <div class="v" id="sysTemp">--<small>℃</small></div>
+      </div>
+    <div class="item" style="margin-top:11px">
+      <div class="k">电荷泵 NTC（模块自身传感器）</div>
+      <div class="v orange" id="realTemp">--<small>℃</small></div>
+    </div>
+    </div>
+  </div>
+
+  <!-- 温度对比 -->
+  <div class="card fade">
+    <div class="card-title">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M14 14.76V3.5a2.5 2.5 0 00-5 0v11.26a4.5 4.5 0 105 0z"/></svg>
+      温度对比（真实 / 伪装）
+    </div>
+    <div class="grid">
+      <div class="item">
+        <div class="k">CPU</div>
+        <div class="v"><span id="cpuReal" class="orange">--</span> <small>/</small> <span id="cpuFake" class="green">--</span></div>
+      </div>
+      <div class="item">
+        <div class="k">GPU</div>
+        <div class="v"><span id="gpuReal" class="orange">--</span> <small>/</small> <span id="gpuFake" class="green">--</span></div>
+      </div>
+      <div class="item">
+        <div class="k">电池</div>
+        <div class="v"><span id="battReal" class="orange">--</span> <small>/</small> <span id="battFake" class="green">--</span></div>
+      </div>
+      <div class="item">
+        <div class="k">充电口</div>
+        <div class="v"><span id="chgReal" class="orange">--</span> <small>/</small> <span id="chgFake" class="green">--</span></div>
+      </div>
+    </div>
+    <div class="hero-hint" style="margin-top:12px;font-size:12px">
+      <span class="orange">橙色=真实温度</span>　<span class="green">绿色=系统读到的伪装值</span>
+    </div>
+  </div>
+
+  <!-- 电池 -->
+  <div class="card fade">
+    <div class="card-title">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="2" y="7" width="17" height="10" rx="2"/><path d="M22 11v2"/></svg>
+      电池
+    </div>
+    <div class="hero" style="margin-bottom:8px">
+      <div class="hero-num" id="cap" style="font-size:38px">--</div>
+      <div class="hero-unit">%</div>
+      <div style="flex:1"></div>
+      <div class="pill" style="font-size:11.5px" id="statusPill">--</div>
+    </div>
+    <div class="bar"><div class="bar-fill" id="capBar" style="width:0%"></div></div>
+  </div>
+
+  <!-- 操作 -->
+  <div class="btns">
+    <button class="btn btn-primary" onclick="act('apply')">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M20 6L9 17l-5-5"/></svg>
+      应用伪装
+    </button>
+    <button class="btn btn-danger" onclick="act('restore')">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 6h18M8 6V4h8v2M19 6l-1 14H6L5 6"/></svg>
+      恢复原状
+    </button>
+  </div>
+
+  <!-- 守护进程 -->
+  <div class="card fade">
+    <div class="card-title">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="3"/><path d="M12 1v6m0 10v6M4.2 4.2l4.3 4.3m7 7l4.3 4.3M1 12h6m10 0h6"/></svg>
+      守护进程
+    </div>
+    <div class="row">
+      <div class="row-l">
+        <div class="row-ico" id="daemonIco">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 2v4m0 12v4M4.9 4.9l2.8 2.8m8.6 8.6l2.8 2.8M2 12h4m12 0h4"/></svg>
+        </div>
+        <div>
+          <div class="row-t">运行状态</div>
+          <div class="row-d" id="daemonDesc">检查中…</div>
+        </div>
+      </div>
+      <div class="pill" style="font-size:11.5px" id="daemonPill">--</div>
+    </div>
+  </div>
+
+  <!-- 日志 -->
+  <div class="card fade">
+    <div class="card-title">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M14 2H6a2 2 0 00-2 2v16a2 2 0 002 2h12a2 2 0 002-2V8z"/><path d="M14 2v6h6M8 13h8M8 17h5"/></svg>
+      运行日志
+      <span style="flex:1"></span>
+      <button onclick="loadLog()" style="background:none;border:none;color:var(--accent);font-size:12px;font-weight:600;cursor:pointer;font-family:inherit">刷新</button>
+    </div>
+    <div class="log-box" id="logBox">加载中…</div>
+  </div>
+
+  </div><!-- /panelMain -->
+
+  <!-- ==================== 屏幕面板 ==================== -->
+  <div class="panel" id="panelScreen">
+
+    <!-- 亮度主卡 -->
+    <div class="card fade" id="brightCard">
+      <div class="card-title">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="4"/><path d="M12 2v2m0 16v2M2 12h2m16 0h2M4.9 4.9l1.4 1.4m11.4 11.4l1.4 1.4M19.1 4.9l-1.4 1.4M6.3 17.7l-1.4 1.4"/></svg>
+        屏幕亮度
+        <span style="flex:1"></span>
+        <span id="blPctTag" style="font-size:20px;font-weight:700;color:var(--text);letter-spacing:-.5px">--</span>
+      </div>
+
+      <div class="slider-wrap">
+        <input type="range" class="slider" id="blSlider" min="1" max="100" value="50" step="1">
+        <div class="slider-ends"><span>暗</span><span id="blRawTag">--/--</span><span>亮</span></div>
+      </div>
+
+      <div class="presets">
+        <button class="preset" data-p="15" onclick="setBright(15)">15%</button>
+        <button class="preset" data-p="30" onclick="setBright(30)">30%</button>
+        <button class="preset" data-p="50" onclick="setBright(50)">50%</button>
+        <button class="preset" data-p="100" onclick="setBright(100)">100%</button>
+      </div>
+      <div class="presets" style="margin-top:8px">
+        <button class="preset" data-p="70" onclick="setBright(70)">70%</button>
+        <button class="preset" data-p="85" onclick="setBright(85)">85%</button>
+        <button class="preset" data-p="95" onclick="setBright(95)">95%</button>
+        <button class="preset" data-p="1" onclick="setBright(1)">最暗</button>
+      </div>
+
+      <div class="hero-hint" style="margin-top:14px;font-size:12px">
+        户外看不清就把亮度拉到 <b>85% 以上</b>。系统默认值只有 11%，是本机看不清的原因。
+      </div>
+    </div>
+
+    <!-- 自动亮度 + 说明 -->
+    <div class="card fade">
+      <div class="card-title">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="3"/><path d="M12 1v6m0 10v6M4.2 4.2l4.3 4.3m7 7l4.3 4.3M1 12h6m10 0h6"/></svg>
+        亮度模式
+      </div>
+      <div class="row">
+        <div class="row-l">
+          <div class="row-ico">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 3a9 9 0 109 9 7 7 0 01-9-9z"/></svg>
+          </div>
+          <div>
+            <div class="row-t">自动亮度</div>
+            <div class="row-d" id="blAutoDesc">关闭后亮度保持固定</div>
+          </div>
+        </div>
+        <button class="switch" id="blAutoSwitch" onclick="toggleAuto()"></button>
+      </div>
+      <div class="row">
+        <div class="row-l">
+          <div class="row-ico">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M20 6L9 17l-5-5"/></svg>
+          </div>
+          <div>
+            <div class="row-t">保持亮度</div>
+            <div class="row-d" id="blKeepDesc">守护进程每 60 秒纠正一次被系统改回的亮度</div>
+          </div>
+        </div>
+      </div>
+      <div class="hero-hint" style="margin-top:12px;font-size:11.5px">
+        面板：<span id="blPanel">--</span>　范围：0 ~ <span id="blMaxTag">--</span>
+      </div>
+    </div>
+
+    <!-- 诊断 -->
+    <div class="card fade">
+      <div class="card-title">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 9v4m0 4h.01M10.3 3.9L1.8 18a2 2 0 001.7 3h17a2 2 0 001.7-3L13.7 3.9a2 2 0 00-3.4 0z"/></svg>
+        亮度诊断
+      </div>
+      <div class="grid">
+        <div class="item">
+          <div class="k">用户设定值</div>
+          <div class="v" id="blWantV">--</div>
+        </div>
+        <div class="item">
+          <div class="k">实际背光</div>
+          <div class="v accent" id="blRawV">--</div>
+        </div>
+      </div>
+      <div class="hero-hint" style="margin-top:11px;font-size:11.5px">
+        两者不一致时点「保持亮度」对应的操作会立刻纠正。当前若显示 255，说明系统设置里存的是 0~255 的旧值，实际背光是另一套 0~16383 的刻度。
+      </div>
+    </div>
+
+  </div><!-- /panelScreen -->
+
+  <footer>温度伪装 + 充电提速 v1.0 · 雨色</footer>
+</div>
+
+<div id="toast"></div>
+
+<script>
+/* ============================================================
+ * KernelSU WebUI 桥接
+ * 官方签名（ksu-next-webui-api）：
+ *   ksu.exec(cmd)                  -> 同步返回 String(stdout)
+ *   ksu.exec(cmd, callbackName)    -> 异步，回调 (exitCode, stdout, stderr)
+ *   ksu.exec(cmd, optsJson, cbName)-> opts 含 cwd / env
+ * 关键：本脚本内绝对不能再声明名为 ksu 的变量，
+ *       否则会遮蔽 KSU 注入的全局 window.ksu。
+ * ============================================================ */
+function toast(msg){
+  const t = document.getElementById('toast');
+  if (!t) return;
+  t.textContent = msg;
+  t.classList.add('show');
+  setTimeout(()=>t.classList.remove('show'), 1800);
+}
+
+// 取得注入的 ksu 对象（兼容注入到顶层 window 的情况）
+// 注意：注入时机可能晚于本脚本执行，因此必须惰性获取，不能只在启动时取一次
+function getKsu(){
+  try { if (window.ksu && typeof window.ksu.exec === 'function') return window.ksu; } catch(e){}
+  try {
+    const t = window.top;
+    if (t && t !== window && t.ksu && typeof t.ksu.exec === 'function') return t.ksu;
+  } catch(e){}
+  try { if (window.ksud && typeof window.ksud.exec === 'function') return window.ksud; } catch(e){}
+  return null;
+}
+let HAS_KSU = getKsu() !== null;
+
+// 把任意返回形态归一成 stdout 字符串
+function toStr(r){
+  if (r == null) return '';
+  if (typeof r === 'string') return r;
+  if (typeof r.stdout === 'string') return r.stdout;
+  if (Array.isArray(r)) return (typeof r[0] === 'string' ? r[0] : '') || '';
+  if (typeof r === 'object') { try { return JSON.stringify(r); } catch(e){ return ''; } }
+  return String(r);
+}
+
+// 统一执行入口：每次调用都重新取，避免注入时序问题
+// 调用点可继续写 await sh(...)（await 非 Promise 值合法）
+function sh(cmd){
+  const k = getKsu();
+  if (!k) { HAS_KSU = false; return ''; }
+  HAS_KSU = true;
+  try {
+    return toStr(k.exec(cmd));
+  } catch(e) {
+    console.error('[webui] exec fail:', cmd, e);
+    return '';
+  }
+}
+
+const BIN = '/data/adb/modules/temp_charge_boost/bin/temp_charge_boost';
+
+// ============ Tab 切换 ============
+let CUR_TAB = 'main';
+function switchTab(name){
+  CUR_TAB = name;
+  document.querySelectorAll('.tab').forEach(t=>{
+    t.classList.toggle('active', t.getAttribute('data-tab') === name);
+  });
+  const pm = document.getElementById('panelMain');
+  const ps = document.getElementById('panelScreen');
+  if (pm) pm.classList.toggle('active', name === 'main');
+  if (ps) ps.classList.toggle('active', name === 'screen');
+  try { localStorage.setItem('tcb_tab', name); } catch(e){}
+  if (name === 'screen') refreshBright();
+}
+
+// ============ 亮度控制 ============
+let BL = { ok:false, max:0, raw:0, pct:0, want:0, auto:-1, panel:'' };
+let BL_BUSY = false;
+let BL_DRAG = false;      // 拖动中不覆盖滑条（避免跳动）
+
+function blApplySliderFill(v){
+  const s = document.getElementById('blSlider');
+  if (s) s.style.setProperty('--fill', v + '%');
+}
+
+function blRender(){
+  const tag = document.getElementById('blPctTag');
+  const s   = document.getElementById('blSlider');
+  if (!BL.ok) {
+    if (tag) tag.textContent = '不支持';
+    if (s) s.disabled = true;
+    const card = document.getElementById('brightCard');
+    if (card) card.style.opacity = '.5';
+    const pt = document.getElementById('blPanel');
+    if (pt) pt.textContent = '未找到可写背光节点';
+    return;
+  }
+  const pct = BL.pct || 1;
+  if (tag) tag.textContent = pct + '%';
+  if (s && !BL_DRAG) { s.value = pct; blApplySliderFill(pct); }
+  const rt = document.getElementById('blRawTag');
+  if (rt) rt.textContent = BL.raw + '/' + BL.max;
+  const mt = document.getElementById('blMaxTag');
+  if (mt) mt.textContent = BL.max;
+  const pt = document.getElementById('blPanel');
+  if (pt) pt.textContent = BL.panel || '--';
+  const wv = document.getElementById('blWantV');
+  if (wv) wv.textContent = BL.want > 0 ? BL.want + '%' : '未设定';
+  const rv = document.getElementById('blRawV');
+  if (rv) rv.textContent = pct + '%';
+
+  // 自动亮度开关
+  const sw = document.getElementById('blAutoSwitch');
+  if (sw) sw.classList.toggle('on', BL.auto === 1);
+  const ad = document.getElementById('blAutoDesc');
+  if (ad) ad.textContent = BL.auto === 1 ? '系统按环境光自动调节'
+    : (BL.auto === 0 ? '固定亮度，不随环境变化' : '无法读取系统设置');
+
+  // 预设高亮
+  document.querySelectorAll('.preset').forEach(b=>{
+    b.classList.toggle('cur', parseInt(b.getAttribute('data-p'),10) === BL.want);
+  });
+}
+
+// 只刷新亮度（走 dump，与主面板共用一次调用更省，但切 tab 时单独拉更简单）
+async function refreshBright(){
+  try{
+    const raw = await sh(BIN + ' bright');
+    if (!raw || raw.trim().charAt(0) !== '{') return;
+    const d = JSON.parse(raw);
+    if (d.bl_ok === false) { BL.ok = false; blRender(); return; }
+    BL.ok = true;
+    BL.max = d.max || 0;
+    BL.raw = d.raw || 0;
+    BL.pct = d.pct || 0;
+    BL.want = d.want || 0;
+    BL.auto = (typeof d.auto === 'number') ? d.auto : -1;
+    BL.panel = d.panel || '';
+    blRender();
+  }catch(e){ console.error(e); }
+}
+
+let blTimer = null;
+async function setBright(pct){
+  if (!BL.ok || BL_BUSY) return;
+  pct = Math.max(1, Math.min(100, Math.round(pct)));
+  BL_BUSY = true;
+  try{
+    await sh(BIN + ' bright ' + pct);
+    BL.want = pct;
+    // 立即乐观更新 UI，避免等 IPC
+    if (BL.max > 0) BL.pct = Math.round(pct);
+    blRender();
+    await new Promise(r=>setTimeout(r, 300));
+    await refreshBright();
+  }catch(e){ toast('设置失败'); }
+  BL_BUSY = false;
+}
+
+async function toggleAuto(){
+  if (!BL.ok || BL_BUSY) return;
+  BL_BUSY = true;
+  const target = BL.auto === 1 ? 0 : 1;
+  try{
+    await sh(BIN + ' bright auto ' + (target ? 'on' : 'off'));
+    BL.auto = target;
+    blRender();
+    toast(target ? '已开启自动亮度' : '已关闭自动亮度');
+    await new Promise(r=>setTimeout(r, 300));
+    await refreshBright();
+  }catch(e){ toast('切换失败'); }
+  BL_BUSY = false;
+}
+
+// 滑条：拖动实时改（节流 120ms），松手立即落盘
+function initSlider(){
+  const s = document.getElementById('blSlider');
+  if (!s) return;
+  s.addEventListener('input', ()=>{
+    BL_DRAG = true;
+    const v = parseInt(s.value, 10);
+    blApplySliderFill(v);
+    const tag = document.getElementById('blPctTag');
+    if (tag) tag.textContent = v + '%';
+    clearTimeout(blTimer);
+    blTimer = setTimeout(()=>{ setBright(v); }, 120);
+  });
+  s.addEventListener('change', ()=>{
+    const v = parseInt(s.value, 10);
+    clearTimeout(blTimer);
+    setBright(v);
+    setTimeout(()=>{ BL_DRAG = false; }, 600);
+  });
+}
+
+async function refresh(){
+  try{
+    const raw = await sh(BIN + ' dump');
+    if (!raw || raw.trim().charAt(0) !== '{') return;
+    const d = JSON.parse(raw);
+
+    // 功率 = 电池电压(V) × 电流(A)
+    const bv = Math.abs(d.bat_voltage) / 1e6;
+    const bi = Math.abs(d.bat_current) / 1e6;
+    const watt = (bv * bi).toFixed(1);
+
+    document.getElementById('power').textContent = watt;
+    document.getElementById('powerHint').textContent =
+      d.charging ? (d.status === 'Full' ? '已充满' : '正在充电') : '未充电';
+    document.getElementById('batV').innerHTML = bv.toFixed(2) + '<small>V</small>';
+    document.getElementById('batI').innerHTML = Math.round(Math.abs(d.bat_current)/1000) + '<small>mA</small>';
+
+    // 伪装状态
+    // 叠层自检：正常时 layers 应等于 mounted；远大于说明发生异常挂载叠层
+    const mEl = document.getElementById('mounted');
+    if (typeof d.layers === 'number' && d.mounted > 0 && d.layers > d.mounted * 1.5) {
+      mEl.textContent = d.mounted + ' / ' + d.layers + '层';
+      mEl.className = 'v red';
+      console.warn('[webui] 挂载叠层异常 layers=' + d.layers + ' mounted=' + d.mounted);
+    } else {
+      mEl.textContent = d.mounted;
+      mEl.className = 'v accent';
+    }
+    document.getElementById('fakeTemp').innerHTML = (d.fake_temp/10).toFixed(1) + '<small>℃</small>';
+    const cl = document.getElementById('ctrlLimit');
+    cl.textContent = d.ctrl_limit;
+    cl.className = 'v ' + (d.ctrl_limit === 0 ? 'green' : d.ctrl_limit >= 14 ? 'red' : 'orange');
+    const pp = document.getElementById('pps');
+    pp.textContent = d.pps_ptf === 1 ? '已启用' : '未启用';
+    pp.className = 'v ' + (d.pps_ptf === 1 ? 'green' : '');
+    document.getElementById('sysTemp').innerHTML = (d.batt_temp/10).toFixed(1) + '<small>℃</small>';
+    document.getElementById('realTemp').innerHTML = (d.real_batt_temp/100).toFixed(1) + '<small>℃</small>';
+    // 注：real_batt_temp 来自 cp_master/batt_temp，单位 0.01℃
+
+    // 温度对比（单位 0.001℃，除以 1000）
+    const f = (v) => v > 0 ? (v/1000).toFixed(1) + '℃' : '--';
+    const fk = (d.fake_val/10).toFixed(1) + '℃';
+    document.getElementById('cpuReal').textContent  = f(d.cpu_real);
+    document.getElementById('cpuFake').textContent  = fk;
+    document.getElementById('gpuReal').textContent  = f(d.gpu_kgsl || d.gpu_real);
+    document.getElementById('gpuFake').textContent  = fk;
+    document.getElementById('battReal').textContent = f(d.batt_real);
+    document.getElementById('battFake').textContent = fk;
+    document.getElementById('chgReal').textContent  = f(d.chg_real);
+    document.getElementById('chgFake').textContent  = fk;
+
+    // 电池
+    document.getElementById('cap').textContent = d.capacity;
+    document.getElementById('capBar').style.width = d.capacity + '%';
+    const sp = document.getElementById('statusPill');
+    sp.textContent = d.status === 'Charging' ? '充电中' : d.status === 'Full' ? '已满' : '放电中';
+
+    // 守护
+    const dp = document.getElementById('daemonPill');
+    dp.textContent = d.daemon_alive ? '运行中' : '已停止';
+    dp.style.color = d.daemon_alive ? 'var(--green)' : 'var(--red)';
+    document.getElementById('daemonDesc').textContent =
+      d.daemon_alive ? '每 5 秒检查充电状态' : '守护进程未运行';
+
+    // 顶栏
+    const dot = document.getElementById('dot');
+    dot.className = 'dot ' + (d.mounted > 0 ? 'on' : 'off');
+    document.getElementById('pillText').textContent = d.mounted > 0 ? '伪装生效' : '未伪装';
+  }catch(e){
+    console.error(e);
+  }
+}
+
+async function loadLog(){
+  const box = document.getElementById('logBox');
+  try{
+    const raw = await sh(BIN + ' log 60');
+    if (!raw || !raw.trim()) { box.textContent = '(暂无日志)'; return; }
+    box.innerHTML = raw.trim().split('\n').map(l=>{
+      const hl = /启动|应用|恢复|变化/.test(l);
+      return `<div class="log-line${hl?' hl':''}">${l.replace(/</g,'&lt;')}</div>`;
+    }).join('');
+    box.scrollTop = box.scrollHeight;
+  }catch(e){ box.textContent = '日志加载失败'; }
+}
+
+async function act(cmd){
+  toast(cmd === 'apply' ? '正在应用…' : '正在恢复…');
+  try{
+    await sh(BIN + ' ' + cmd);
+    await new Promise(r=>setTimeout(r, 900));
+    await refresh();
+    await loadLog();
+    toast(cmd === 'apply' ? '已应用伪装' : '已恢复原状');
+  }catch(e){ toast('操作失败'); }
+}
+
+// ============ 初始化 ============
+// 未注入 ksu 时给出明确提示（浏览器直开、WebView 无注入等）
+function showNoKsuWarn(){
+  if (document.getElementById('ksuWarn')) return;
+  const warn = document.createElement('div');
+  warn.id = 'ksuWarn';
+  warn.style.cssText = 'position:fixed;left:12px;right:12px;bottom:64px;z-index:99;' +
+    'padding:12px 14px;border-radius:14px;font-size:13px;line-height:1.5;' +
+    'background:rgba(255,149,0,.16);color:#c26a00;' +
+    'border:1px solid rgba(255,149,0,.35);backdrop-filter:blur(12px)';
+  warn.innerHTML = '<b>未检测到 KernelSU 接口</b><br>' +
+    '请从 KernelSU / Magisk 管理器的模块页面打开本页面（不要用浏览器直接打开），' +
+    '否则无法执行 root 命令。';
+  document.body.appendChild(warn);
+  const dot = document.getElementById('dot');
+  if (dot) dot.className = 'dot off';
+  const pt = document.getElementById('pillText');
+  if (pt) pt.textContent = '无 KSU 接口';
+}
+if (!HAS_KSU) {
+  showNoKsuWarn();
+  console.warn('[webui] ksu not injected yet. typeof window.ksu =', typeof window.ksu);
+  // 注入可能迟到：12 秒内每 1.5 秒重试一次，拿到就自动接管并撤掉提示
+  let tries = 0;
+  const retry = setInterval(() => {
+    tries++;
+    if (getKsu()) {
+      clearInterval(retry);
+      HAS_KSU = true;
+      const w = document.getElementById('ksuWarn');
+      if (w) w.remove();
+      console.log('[webui] ksu injected late, retry#' + tries);
+      refresh(); loadLog();
+    } else if (tries >= 8) {
+      clearInterval(retry);
+    }
+  }, 1500);
+} else {
+  console.log('[webui] ksu ready');
+}
+
+refresh();
+loadLog();
+setInterval(refresh, 3000);
+setInterval(loadLog, 15000);
+
+// 亮度初始化
+initSlider();
+(function initBrightTab(){
+  // 恢复上次所在 tab
+  let saved = 'main';
+  try { saved = localStorage.getItem('tcb_tab') || 'main'; } catch(e){}
+  // 先用 dump 探一次 bl_ok，决定是否显示"屏幕"tab
+  const k = getKsu();
+  if (k) {
+    try {
+      const raw = toStr(k.exec(BIN + ' dump'));
+      if (raw && raw.trim().charAt(0) === '{') {
+        const d = JSON.parse(raw);
+        const tabS = document.getElementById('tabScreen');
+        if (d.bl_ok === false && tabS) {
+          tabS.style.display = 'none';   // 本机无背光节点时不显示该 tab
+          saved = 'main';
+        }
+      }
+    } catch(e){}
+  }
+  switchTab(saved);
+  refreshBright();
+  // 屏幕 tab 下每 5 秒刷一次亮度（比 dump 的 3 秒轻，且仅在激活时跑）
+  setInterval(()=>{ if (CUR_TAB === 'screen') refreshBright(); }, 5000);
+})();
+</script>
+</body>
+</html>
