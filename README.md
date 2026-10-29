@@ -161,6 +161,7 @@ temp_charge_boost log [行数]           # 日志尾部
   否则回退到独立 NTC `batt_therm`。**禁止回退到 `charger_therm`**——它也在伪装范围内，回退过去等于换个假值（实测显示 35.0℃）。
 - 🐛 **`daemon_alive` 不再只看 PID 文件**：改为校验 `/proc/<pid>/cmdline` 同时命中 `temp_charge_boost` 与 `daemon`。
   原来 PID 被内核复用给别的进程（实测被 `com.miui.daemon` 占用）时，WebUI 会显示「守护进程运行中」但实际早已死掉。
+  注意这两件事可以同时发生：daemon 真的在跑、而 pid 文件里记的旧 PID 已被复用，此时旧代码的「运行中」是巧合正确。
 - ✅ 测试扩到 121 项断言（新增 L 时间跳变 / M 伪装值不得当真值 / N 电荷泵陈旧值 / O PID 复用）
 - ✅ 测试基础设施加固：抽出 `mock_env.sh` 统一搭环境，消除 `logic_test` 对 `mock_test` 的隐式顺序依赖；
   每个测试自建环境、自收拾挂载残留；解析不到源码常量直接失败而不是静默降级
