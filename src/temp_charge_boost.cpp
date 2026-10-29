@@ -829,6 +829,9 @@ static void open_real_fds();
 static void close_real_fds();
 static void flush_real_values();
 static int  read_live_real(long zn);
+// 前向声明：wall_real_batt_temp()（约 1535 行）在 snapshot_fresh() 定义（约 1960 行）
+// 之前就用到它。温度墙必须与 dump 用同一套新鲜度判据，否则两条路径判定不一致。
+static bool snapshot_fresh();
 
 static int do_scan(bool verbose) {
     logf("[scan] === 开始扫描温度节点 ===");
@@ -1430,7 +1433,7 @@ static bool bl_set_pct(int pct) {
     // 关自动亮度（这个只能走 settings，没有对应 sysfs；写它不会重置亮度）
     if (bl_auto_mode_cached() == 1) settings_put("screen_brightness_mode", 0);
     g_auto_cache = 0;
-    g_auto_ts    = (long)time(nullptr);
+    g_auto_ts    = mono_ms();   // 必须与 bl_auto_mode_cached() 同一时钟（mono），否则缓存判据永远错
     bl_save_state(0, pct, raw);
 
     // 记下用户意图，守护进程据此纠正被系统改回的情况
@@ -1446,7 +1449,7 @@ static bool bl_set_auto(int on) {
     if (!settings_bin()) return false;
     settings_put("screen_brightness_mode", on ? 1 : 0);
     g_auto_cache = on ? 1 : 0;
-    g_auto_ts    = (long)time(nullptr);
+    g_auto_ts    = mono_ms();   // 同上：与缓存读取侧保持单调时钟一致
     bl_save_state(on ? 1 : 0, bl_want_pct(), bl_cur_raw());
     return true;
 }
@@ -1544,13 +1547,12 @@ static int wall_real_batt_temp() {
     if (z >= 0) {
         char p[256];
         snprintf(p, sizeof(p), "%s/thermal_zone%ld", REAL_DIR, z);
-        struct stat st;
-        if (stat(p, &st) == 0) {
-            long age = (long)time(nullptr) - (long)st.st_mtime;
-            if (age >= 0 && age <= 120) {
-                int v = 0;
-                if (read_int(p, &v) && v > 0) return v;
-            }
+        // 必须用 snapshot_fresh() 的三重判据，不能再用 time(nullptr)-st_mtime：
+        // 这是安全关键路径（温度墙据它决定限流档位），
+        // 系统时间跳回过去时 age 变负 → 快照被丢弃 → 返回 0 → 温度墙静默停用。
+        if (snapshot_fresh()) {
+            int v = 0;
+            if (read_int(p, &v) && v > 0) return v;
         }
     }
     // ③ 明确返回 0：宁可不控，也不用被 fake_temp 改写的假值控
@@ -2468,12 +2470,12 @@ int main(int argc, char **argv) {
             if (trusted) bz = g_prof.batt_zone;
         }
         if (bz >= 0) {
-            bt = read_live_real(bz);
-            if (bt <= 0) {
-                char zp[256];
-                snprintf(zp, sizeof(zp), "%s/thermal_zone%ld/temp", ZONE_ROOT, bz);
-                read_int(zp, &bt);
-            }
+            // 必须走 wall_real_batt_temp()：内部顺序是
+            //   ① 持久 fd（仅 daemon 内有效）→ ② snapshot_fresh() 三重判据 → ③ 返回 0
+            // 原来这里 read_live_real 失败后直接 read_int(sysfs)，
+            // 而该节点已被 bind mount 伪装 → 读到 350（35.0℃）→ WebUI 温度墙显示假值。
+            // 与 read_best() 的修复同源，此处原先漏改。
+            bt = wall_real_batt_temp();
         }
         printf("{\"ok\":true,\"wall_on\":%d,\"wall_c\":%d,\"wall_force\":%d,"
                "\"batt_temp\":%d,\"batt_src\":\"zone%ld\",\"batt_trusted\":%d,\"curr\":%d}\n",

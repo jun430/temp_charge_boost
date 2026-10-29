@@ -147,6 +147,32 @@ temp_charge_boost log [行数]           # 日志尾部
 > 第 3 步是关键：若卸载时温度墙正在限流，不恢复电流会让充电永久卡在最低 3A，用户很难自查。
 
 ## 版本历史
+### v1.3.2 (2026-10-29)
+补 v1.3.1 漏改的同类缺陷——**部署到真机后实测发现，不靠推断**。
+
+v1.3.1 把「时间基准」改成了单调时钟，但只改了一部分，三处仍用墙钟，其中一处在安全关键路径上：
+
+- 🐛 **`wall_real_batt_temp()` 仍用 `time(nullptr) - st_mtime` 判快照新鲜度**（温度墙实际使用的取温函数）。
+  时间跳变时 age 变负 → 快照丢弃 → 返回 0 → **温度墙静默停用**。改为复用 `snapshot_fresh()` 三重判据。
+  这是线上「真实温度 0.3℃」事故的**真正落点**：daemon 那条路径修了，温度墙这条没修。
+- 🐛 **`wall` 命令回退直读 sysfs**：`read_live_real` 失败后直接 `read_int(thermal_zoneN/temp)`，
+  而该节点已被 bind mount 伪装 → 返回 350（35.0℃）。改为复用 `wall_real_batt_temp()`，与 daemon 同判据。
+- 🐛 **亮度缓存时钟混用**：`bl_auto_mode_cached()` 用 `mono_ms()` 写缓存，但 `bl_set_manual`/`bl_set_auto`
+  却写 `(long)time(nullptr)` → 两个时钟混用，缓存判据永远错（要么永久命中、要么永久失效）。
+
+**真机验证（本机 Redmi K100 Pro Max / M108FE / OS3.0.310 / Android 16）**
+
+| 验证项 | 结果 |
+|---|---|
+| 节点语义实测 | zone84=`batt_therm` 独立 NTC（Δ=-32 不跟随），`batt_trusted=1`，zone67/68 归兜底 |
+| 快照 mtime 改成 1970 + 停 daemon | `wall` 仍读 `batt_temp=51621`（真实值），未回退到伪装值 350 |
+| PID 复用（旧 pid 指向 com.miui.daemon） | `daemon_alive=false`，不再误报 |
+| 温度墙按真实温度工作 | 50.9℃ 起逐档 60%→48%→36%→26%→16%→8%，降到 51.2℃ 后自动回升至 72% |
+
+> 注：`real_batt_temp` 取 `cp_master/batt_temp`（电荷泵自测电池温度，单位 0.01℃），
+> 与独立 NTC 存在温差属正常（实测 64.0℃ vs 51.2℃，因电荷泵自身发热）。
+> WebUI 主显示用 `batt_ntc`（独立 NTC），此字段仅作参考。
+
 ### v1.3.1 (2026-10-29)
 修一批**只在长时间运行 / 异常环境才暴露**的真实缺陷。触发场景：系统时间跳变（RTC 未同步）+ PID 复用。
 
