@@ -9,7 +9,16 @@
 set -u
 BIN=${1:-/root/tcb_build/t_bin}
 R=/tmp/tcbe2e
-rm -rf $R; mkdir -p $R
+# 先剥掉上一轮的残留挂载：bind mount 之下的目录 rm -rf 删不掉，
+# 会在脏目录上叠加，导致测试结果不可信（本轮已实测踩到）。
+if [ -d "$R" ]; then
+  awk -v p="$R" '$5==p || index($5,p"/")==1 {print $5}' /proc/self/mountinfo 2>/dev/null \
+    | awk '{print length, $0}' | sort -rn | cut -d' ' -f2- \
+    | while read -r m; do umount -l "$m" 2>/dev/null; done
+fi
+rm -rf $R 2>/dev/null
+if [ -e "$R" ]; then echo "  [环境异常] $R 无法清空，测试结果不可信"; exit 1; fi
+mkdir -p $R
 export TCB_ROOT=$R
 Z=$R/sys/devices/virtual/thermal
 W=$R/sys/class/xm_power/charger/charger_thermal/wired_chg_curr

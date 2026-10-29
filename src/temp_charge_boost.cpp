@@ -695,6 +695,19 @@ static int zone_follows_fake_temp(long zn) {
     return res;
 }
 
+// ============ 单调时钟（全局公共）============
+//
+// 全局统一用它做「时间差」计算，不用 time(nullptr)：
+//   手机上的 wall clock 随时可能跳变 —— 开机早期 RTC 未同步、NTP 回拨、
+//   用户手动改时间、时区切换。任何「多久之后该做某事」「多久之前写的」判断
+//   一旦用了 wall clock，跳变就会让它永久失效或瞬间误触发。
+//   已实测踩过三处：快照刷新停摆、快照新鲜度判定失效、温度墙积分项失灵。
+static long mono_ms() {
+    struct timespec ts;
+    if (clock_gettime(CLOCK_MONOTONIC, &ts) != 0) return 0;
+    return (long)ts.tv_sec * 1000L + ts.tv_nsec / 1000000L;
+}
+
 // 节点是否可写（判断充电控制点用）
 static bool node_writable(const std::string &p) {
     return access(p.c_str(), W_OK) == 0;
@@ -1329,8 +1342,9 @@ static int bl_auto_mode() {
 static int  g_auto_cache = -1;
 static long g_auto_ts    = 0;
 static int bl_auto_mode_cached() {
-    long now = (long)time(nullptr);
-    if (g_auto_cache >= 0 && now - g_auto_ts < 30) return g_auto_cache;
+    // 单调时钟：避免改时间后缓存永久命中/永久失效
+    long now = mono_ms();
+    if (g_auto_cache >= 0 && now - g_auto_ts < 30000) return g_auto_cache;
     int v = bl_auto_mode();
     if (v >= 0) { g_auto_cache = v; g_auto_ts = now; }
     return v;
@@ -1661,7 +1675,11 @@ static void wall_tick() {
 
     if (bt <= 0) return;                       // 读不到真实温度就不要乱写
 
-    long now = (long)time(nullptr);
+    // ⚠ 时间基准统一用单调时钟（秒）。
+    //   原来用 time(nullptr)：系统时间跳变会让 g_wall_push_at / relax_at 算出
+    //   负数或巨大的间隔 —— 要么积分项永久不触发（限流失控），要么瞬间跳档。
+    //   温度墙是安全相关逻辑，时间基准不能受用户改时间影响。
+    long now = mono_ms() / 1000L;
 
     int need = wall_tier_from_temp(bt, wall_c);
 
@@ -1780,10 +1798,14 @@ static void run_daemon() {
         wall_tick();
 
         // 冷路径：快照按固定间隔刷新
-        long now = (long)time(nullptr);
-        if (now - last_flush >= FLUSH_INTERVAL) {
+        // ⚠ 必须用单调时钟：原来用 time(nullptr) 做差，一旦系统时间倒退
+        //   （开机早期 RTC 未同步、手动改时间），now - last_flush 变负数，
+        //   条件永远不成立 —— 快照从此再也不刷新，WebUI 真实温度全部停摆。
+        //   实测踩过：日志里时间从 10-28 跳回 01-13 后，快照就再没更新过。
+        long mono = mono_ms();
+        if (mono - last_flush >= (long)FLUSH_INTERVAL * 1000L) {
             flush_real_values();
-            last_flush = now;
+            last_flush = mono;
         }
 
         sleep(chg ? POLL_CHARGING : POLL_IDLE);
@@ -1837,7 +1859,73 @@ static int read_real(const char *zone) {
 // 注意：fd 只在持有它的进程内有效，daemon 需把实时值写入 REAL_DIR 供 WebUI 读取。
 
 #include <map>
+#include <ctime>
 static std::map<long, int> g_real_fd;   // zone 编号 -> fd
+
+// ============ 快照新鲜度判定（不依赖系统时间）============
+//
+// 为什么不能用 time(nullptr) - st_mtime：
+//   实测踩过 —— 设备重启后 RTC 未同步，系统时间从 2026-10 跳回 1970-01，
+//   快照文件 mtime 变成 1970，算出的 age 是几十年（甚至负数），
+//   导致所有快照被判定为"陈旧"而全部丢弃，WEBUI 真实温度全变 0.3℃。
+//   这类时钟跳变在手机上是常态（开机早期、时区/手动改时间、NTP 回拨），
+//   拿 wall clock 做新鲜度判定本身就是错的。
+//
+// 现在的判据（三重，任一不满足即视为陈旧）：
+//   ① boot_id 必须等于当前开机 —— 排除"上次开机写的快照"
+//   ② 写入时刻用 CLOCK_MONOTONIC 记录 —— 单调递增，不受改时间影响
+//   ③ 单调时钟差 <= 120 秒 —— 排除"本次开机但 daemon 早已停掉"
+//
+// 侧车文件格式：REAL_DIR/.meta 内容为 "<boot_id> <monotonic_ms>"
+static const char *current_boot_id() {
+    // 一次开机内不会变，缓存住避免反复 open
+    static char cached[64] = {0};
+    if (cached[0]) return cached;
+    int fd = open("/proc/sys/kernel/random/boot_id", O_RDONLY | O_CLOEXEC);
+    if (fd < 0) return "";
+    ssize_t n = read(fd, cached, sizeof(cached) - 1);
+    close(fd);
+    if (n <= 0) { cached[0] = 0; return ""; }
+    cached[n] = 0;
+    // 去掉尾部换行，避免比对时差一个 \n
+    for (int i = 0; cached[i]; i++)
+        if (cached[i] == '\n' || cached[i] == '\r') { cached[i] = 0; break; }
+    return cached;
+}
+
+// 写快照元信息（每次 flush 调用一次，不按 zone 重复写）
+static void write_snapshot_meta() {
+    const char *bid = current_boot_id();
+    if (!bid[0]) return;               // 拿不到 boot_id 就不写，read 侧会视为不可用
+    char p[256];
+    snprintf(p, sizeof(p), "%s/.meta", REAL_DIR);
+    int fd = open(p, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
+    if (fd < 0) return;
+    char b[128];
+    int k = snprintf(b, sizeof(b), "%s %ld\n", bid, mono_ms());
+    ssize_t w = write(fd, b, k); (void)w;
+    close(fd);
+}
+
+// 快照是否可用（新鲜且属于本次开机）
+static bool snapshot_fresh() {
+    const char *bid = current_boot_id();
+    if (!bid[0]) return false;
+    char p[256];
+    snprintf(p, sizeof(p), "%s/.meta", REAL_DIR);
+    FILE *fp = fopen(p, "r");
+    if (!fp) return false;
+    char sb[64] = {0};
+    long written = 0;
+    int got = fscanf(fp, "%63s %ld", sb, &written);
+    fclose(fp);
+    if (got != 2) return false;
+    if (strcmp(sb, bid) != 0) return false;          // 上次开机写的，丢弃
+    long age = mono_ms() - written;
+    if (age < 0) return false;                        // 单调时钟倒退（理论上不会）
+    if (age > 120000L) return false;                  // 超过 120 秒未刷新
+    return true;
+}
 
 static void open_real_fds() {
     DIR *d = opendir(ZONE_ROOT);
@@ -1873,23 +1961,27 @@ static int read_live_real(long zn) {
 
 // 读真实温度（三级回退）：
 // ① 持久 fd 实时值（仅 daemon 进程内有效，最准确）
-// ② REAL_DIR 快照（daemon 写，供 dump 等独立进程跨进程读取；有新鲜度门限）
-// ③ 直接读 sysfs（daemon 未运行时；若已伪装则为伪装值，但优于返回 0）
+// ② REAL_DIR 快照（daemon 写，供 dump 等独立进程跨进程读取；按 boot_id + 单调时钟判新鲜）
+// ③ 直接读 sysfs —— **仅当该节点没有被本模块伪装时**
 //
-// 新鲜度门限的意义：REAL_DIR 是磁盘文件，daemon 停掉后仍保留上次写的值。
-// 若不加限制，旧快照会盖住 sysfs 的真实读数（实测出现过 98℃ vs 43℃ 的错乱）。
-// 因此只接受 120 秒内写过的快照。
+// 为什么 ③ 必须加"未伪装"条件：
+//   实测踩过 —— 快照被判陈旧被丢弃后，回退读 sysfs 拿到的是 bind mount 之后的
+//   伪装值（350），却被当成"真实温度"显示，WebUI 上真实温度全是 0.3℃。
+//   这比返回 0 更糟：0 至少能看出"读不到"，假值会被当真。
+//   所以节点若已挂载我们的假值文件，就不能拿 sysfs 当真实值，直接返回 0。
 static int read_best(long zn) {
     int v = read_live_real(zn);
     if (v > 0) return v;
+
     char p[256];
-    snprintf(p, sizeof(p), "%s/thermal_zone%ld", REAL_DIR, zn);
-    struct stat st;
-    if (stat(p, &st) == 0) {
-        long age = (long)time(nullptr) - (long)st.st_mtime;
-        if (age >= 0 && age <= 120 && read_int(p, &v) && v > 0) return v;
+    if (snapshot_fresh()) {
+        snprintf(p, sizeof(p), "%s/thermal_zone%ld", REAL_DIR, zn);
+        if (read_int(p, &v) && v > 0) return v;
     }
+
+    // ③ sysfs：只有确认未被伪装才可信
     snprintf(p, sizeof(p), "%s/thermal_zone%ld/temp", ZONE_ROOT, zn);
+    if (is_mounted(p)) return 0;        // 已被本模块接管，读到的是假值，不能当真实值
     if (read_int(p, &v) && v > 0) return v;
     return 0;
 }
@@ -1969,6 +2061,8 @@ static void flush_real_values() {
         if (z >= 0 && n < 64) zones[n++] = z;
     }
 
+    int last_written = 0;
+
     for (int i = 0; i < n; i++) {
         long zn = zones[i];
         int v = read_live_real(zn);
@@ -1981,7 +2075,14 @@ static void flush_real_values() {
         int k = snprintf(b, sizeof(b), "%d\n", v);
         ssize_t w = write(fd, b, k); (void)w;
         close(fd);
+        if (w > 0) last_written++;
     }
+
+    // 关键：写完数据必须同步更新元信息，否则 read_best() 的 snapshot_fresh()
+    // 会因为找不到 / 过期的 .meta 而把上面刚写的快照全部判为陈旧丢弃。
+    // 有有效数据才写 meta：一个都没写到就说明 daemon 拿不到真实值（fd 没打开），
+    // 此时不该把 meta 刷新成"新鲜"，否则会把空快照当成有效数据。
+    if (last_written > 0) write_snapshot_meta();
 }
 
 // ============ dump（WebUI 用）============
@@ -2038,22 +2139,31 @@ static void dump_json() {
     read_int(N_PPS_PTF, &pp);
 
     // 真实温度：优先读电荷泵自带 NTC（cp_master/batt_temp，单位 0.01℃）
-    // 但电荷泵停工时该节点会返回陈旧值（实测卡死 6400），
-    // 判据：ibus 接近 0（未在充放电）或值异常时，回退到 charger_therm 真实值。
+    // 但电荷泵停工时该节点会返回陈旧值（实测卡死 6400 = 64℃，恰是安全上限），
+    // 判据：ibus 接近 0（未在充放电）或值明显不合理时，回退到独立 NTC。
+    //
+    // ⚠ 回退目标必须是"不受 fake_temp 影响"的节点（batt_therm），
+    //   不能用 charger_therm —— 后者也在伪装范围内，回退过去等于换个假值。
+    //   实测踩过：回退到 charger_therm 后 real_batt_temp 直接显示 35.0℃（伪装值）。
     int real_bt = 0;
     {
-        read_int("/sys/class/xm_power/cp_master/batt_temp", &real_bt);
+        int cp_raw = 0;
+        read_int("/sys/class/xm_power/cp_master/batt_temp", &cp_raw);
         int cp_ibus = 0;
         read_int("/sys/class/xm_power/cp_master/ibus", &cp_ibus);
         bool cp_idle = (cp_ibus <= 10);
-        if (cp_idle || real_bt <= 0 || real_bt > 10000) {
-            long z72 = zone_by_type("charger_therm");
-            int v = (z72 >= 0) ? read_live_real(z72) : 0;
-            if (v <= 0 && z72 >= 0) {
-                char p[256];
-                snprintf(p, sizeof(p), "%s/thermal_zone%ld/temp", ZONE_ROOT, z72);
-                read_int(p, &v);
-            }
+
+        // cp_master 单位是 0.01℃，有效范围 10.00~99.99℃（1000~9999）
+        // 6400 正是"没充电时驱动返回的默认/陈旧值"，必须排除
+        bool cp_valid = (cp_raw >= 1000 && cp_raw <= 9999) && !cp_idle;
+        if (cp_valid) {
+            real_bt = cp_raw;
+        } else {
+            // 回退到实测确认的独立 NTC
+            long z = zone_by_type("batt_therm");
+            if (z < 0 && load_profile() && g_prof.batt_trusted)
+                z = g_prof.batt_zone;
+            int v = (z >= 0) ? read_best(z) : 0;
             if (v > 0) real_bt = v / 10;   // 0.001℃ -> 0.01℃，与 cp_master 同刻度
         }
     }
@@ -2115,15 +2225,32 @@ static void dump_json() {
     read_str("/sys/class/power_supply/battery/status", status);
 
     // 守护进程存活
+    // ⚠ 不能只看 /proc/<pid> 是否存在：PID 会被内核复用。
+    //   实测踩过 —— daemon 早就死了，pid 文件留着 10038，
+    //   而 10038 已被 com.miui.daemon 占用，WebUI 于是显示"守护进程运行中"，
+    //   用户完全不知道实际已停摆（真实温度也读不到，全显示 0.3℃）。
+    //   判据：/proc/<pid>/cmdline 必须真的指向本模块二进制。
     bool daemon_alive = false;
     {
         char p[128];
         snprintf(p, sizeof(p), "%s/daemon.pid", WORK_DIR);
         int pid = 0;
         if (read_int(p, &pid) && pid > 0) {
-            char sp[64];
-            snprintf(sp, sizeof(sp), "/proc/%d", pid);
-            daemon_alive = (access(sp, F_OK) == 0);
+            char sp[128];
+            snprintf(sp, sizeof(sp), "/proc/%d/cmdline", pid);
+            int fd = open(sp, O_RDONLY | O_CLOEXEC);
+            if (fd >= 0) {
+                char cb[512] = {0};
+                ssize_t n = read(fd, cb, sizeof(cb) - 1);
+                close(fd);
+                if (n > 0) {
+                    // cmdline 是 \0 分隔，转成空格方便 strstr
+                    for (ssize_t i = 0; i < n; i++) if (cb[i] == '\0') cb[i] = ' ';
+                    // 必须同时命中二进制名和 daemon 子命令，防同名进程误判
+                    if (strstr(cb, "temp_charge_boost") && strstr(cb, "daemon"))
+                        daemon_alive = true;
+                }
+            }
         }
     }
 

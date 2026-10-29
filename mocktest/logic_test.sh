@@ -3,7 +3,12 @@
 # 用法: bash logic_test.sh /root/tcb_build/t_bin
 set -u
 BIN=${1:-/root/tcb_build/t_bin}
-R=/tmp/tcbmock
+# 独立环境：不再假设 mock_test.sh 已经建好 /tmp/tcbmock。
+# 原来直接复用该目录，形成隐式顺序依赖——
+# mock_test 先跑就通过，环境被清理就 15 项全崩（本轮实测踩到）。
+R=/tmp/tcb_logic
+. "$(dirname "$0")/mock_env.sh"
+if ! mock_env "$R"; then exit 1; fi
 export TCB_ROOT=$R
 Z=$R/sys/devices/virtual/thermal
 W=$R/sys/class/xm_power/charger/charger_thermal/wired_chg_curr
@@ -78,6 +83,12 @@ v=$(cat $Z/thermal_zone85/temp 2>/dev/null)   # batt_therm
 chk "batt_therm (zone85) 被伪装" "$v" "350"
 
 echo ""
+# ---- 收尾：解除伪装挂载 + 删目录（测试必须自己收拾干净） ----
+$BIN restore >/dev/null 2>&1
+awk -v p="$R" '$5==p || index($5,p"/")==1 {print $5}' /proc/self/mountinfo 2>/dev/null | awk '{print length, $0}' | sort -rn | cut -d" " -f2- | while read -r m; do umount -l "$m" 2>/dev/null; done
+rm -rf "$R" 2>/dev/null
+LEFT=$(awk -v p="$R" '$5==p || index($5,p"/")==1 {n++} END {print n+0}' /proc/self/mountinfo 2>/dev/null)
+if [ "$LEFT" != "0" ]; then echo "  FAIL  收尾后仍有 $LEFT 个挂载残留"; FAIL=$((FAIL+1)); fi
 echo "================================"
 echo "通过 $PASS / 失败 $FAIL"
 exit $([ $FAIL -eq 0 ] && echo 0 || echo 1)

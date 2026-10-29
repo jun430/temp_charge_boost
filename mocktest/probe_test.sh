@@ -27,7 +27,24 @@ ng(){ FAIL=$((FAIL+1)); echo "  FAIL  $1"; }
 
 build_env() {
   R=$1
-  rm -rf $R; mkdir -p $R/sys/devices/virtual/thermal $R/sys/class/xm_power/fuelgauge/strategy_fg
+  # 关键：上一轮测试若异常退出，会留下 bind mount。
+  # bind mount 之下的目录 rm -rf 删不掉（EBUSY 语义），
+  # 于是"新建环境"实际是在脏目录上叠加 → 测试结果不可信
+  # （本轮 L 组就是在 fake_temp 写失败的空环境里"偶然通过"的）。
+  # 因此先按挂载深度倒序全部剥掉，再删除目录。
+  if [ -d "$R" ]; then
+    awk -v p="$R" '$5==p || index($5,p"/")==1 {print $5}' /proc/self/mountinfo 2>/dev/null \
+      | awk '{print length, $0}' | sort -rn | cut -d' ' -f2- \
+      | while read -r m; do umount -l "$m" 2>/dev/null; done
+    wait 2>/dev/null
+  fi
+  rm -rf $R 2>/dev/null
+  if [ -e "$R" ]; then
+    echo "  [环境异常] $R 无法清空（可能有残留挂载或权限问题），测试结果不可信"
+    FAIL=$((FAIL+1))
+    return 1
+  fi
+  mkdir -p $R/sys/devices/virtual/thermal $R/sys/class/xm_power/fuelgauge/strategy_fg
   Z=$R/sys/devices/virtual/thermal
   X=$R/sys/class/xm_power
   P=$R/sys/class/power_supply
@@ -53,6 +70,12 @@ build_env() {
   # 独立 NTC：真实文件，不跟随（毫摄氏度 42600 = 42.6℃）
   mkdir -p $Z/thermal_zone85; echo -n "batt_therm" > $Z/thermal_zone85/type
   echo 42600 > $Z/thermal_zone85/temp
+
+  # CPU 每核温度（真机是 cpu-N-M-* 独立 NTC，同样在伪装范围内）
+  # 这些节点也必须进快照，否则 WebUI 的 cpu_list / cpu_max 全是 0
+  mkdir -p $Z/thermal_zone20; echo -n "cpu-0-0-0" > $Z/thermal_zone20/type; echo 55000 > $Z/thermal_zone20/temp
+  mkdir -p $Z/thermal_zone21; echo -n "cpu-0-1-0" > $Z/thermal_zone21/type; echo 52000 > $Z/thermal_zone21/temp
+  mkdir -p $Z/thermal_zone22; echo -n "cpu-1-0-0" > $Z/thermal_zone22/type; echo 48000 > $Z/thermal_zone22/temp
 
   mkdir -p $Z/thermal_zone36; echo -n "gpuss-0" > $Z/thermal_zone36/type; echo 55000 > $Z/thermal_zone36/temp
   mkdir -p $Z/thermal_zone86; echo -n "conn_therm" > $Z/thermal_zone86/type; echo 38000 > $Z/thermal_zone86/temp
@@ -221,6 +244,114 @@ if [ -f "$CUST" ]; then
     grep -q 'set_perm' "$CUST" && ok "设置了文件权限" || ng "未设权限"
 else
     echo "  SKIP  未找到 customize.sh（$CUST）"
+fi
+
+echo ""
+echo "############ L. 时间跳变不得让真实温度读取失效 ############"
+# 复现线上事故：RTC 未同步 → 系统时间跳回过去 → 快照 mtime 变成 1970
+# → 旧实现算 age 得负数 → 快照全丢 → 回退读 sysfs（被伪装）→ 显示 0.3℃
+build_env /tmp/tcbp10
+D=$R/data/adb/temp_charge_boost
+# 建立伪装（同时写快照 + meta）
+$BIN apply 350 >/dev/null 2>&1
+# 确认 .meta 存在（快照新鲜度判定的载体）
+[ -f $D/real/.meta ] && ok "flush 写出了 .meta（boot_id + 单调时钟）" || ng "未写 .meta，快照无法判新鲜"
+META=$(cat $D/real/.meta 2>/dev/null)
+echo "$META" | grep -qE '^[0-9a-f-]{36} [0-9]+' && ok ".meta 格式正确（boot_id + mono_ms）" || ng ".meta 格式异常: $META"
+# 把快照文件 mtime 改成 1970（模拟时钟跳变后写入）
+find $D/real -name 'thermal_zone*' -exec touch -t 197001140044 {} \; 2>/dev/null
+# 关键：真实温度仍必须读得出来（不能因 mtime 是 1970 就丢弃）
+OUT=$($BIN dump 2>/dev/null)
+V=$(echo "$OUT" | tr ',' '\n' | grep '"batt_ntc"' | grep -o '[0-9]*$')
+if [ -n "$V" ] && [ "$V" != "350" ] && [ "$V" -gt 1000 ]; then
+    ok "mtime=1970 时仍读到真实温度 batt_ntc=$V（不再被误判陈旧）"
+else
+    ng "mtime=1970 时真实温度读取失败: batt_ntc=$V（期望 >1000 且 != 350）"
+fi
+# CPU 同理
+CPU=$(echo "$OUT" | tr ',' '\n' | grep -A0 '"cpu_max"' | grep -o '[0-9]*$')
+if [ -n "$CPU" ] && [ "$CPU" != "350" ] && [ "$CPU" -gt 1000 ]; then
+    ok "mtime=1970 时 CPU 温度正常 cpu_max=$CPU"
+else
+    ng "mtime=1970 时 CPU 温度异常: cpu_max=$CPU"
+fi
+
+echo ""
+echo "############ M. 已伪装节点不得被当成真实温度源 ############"
+# 快照完全不可用时（删掉 .meta），read_best 回退 sysfs；
+# 但该节点已 bind mount，读到的是伪装值 350 —— 必须拒绝，返回 0 而不是 350。
+rm -f $D/real/.meta
+OUT2=$($BIN dump 2>/dev/null)
+V2=$(echo "$OUT2" | tr ',' '\n' | grep '"batt_ntc"' | grep -o '[0-9]*$')
+if [ "$V2" = "0" ] || [ -z "$V2" ]; then
+    ok "无快照时拒绝把伪装值当真值（batt_ntc=$V2）"
+elif [ "$V2" = "350" ]; then
+    ng "无快照时把伪装值 350 当成真实温度（应为 0）"
+else
+    ok "无快照时仍读到有效真值 batt_ntc=$V2"
+fi
+
+echo ""
+echo "############ N. real_batt_temp 不得取电荷泵陈旧值 ############"
+build_env /tmp/tcbp11
+D=$R/data/adb/temp_charge_boost
+# 造 cp_master：batt_temp=6400（陈旧）+ ibus=0（未充电）→ 必须被排除
+mkdir -p $R/sys/class/xm_power/cp_master
+echo 6400 > $R/sys/class/xm_power/cp_master/batt_temp
+echo 0    > $R/sys/class/xm_power/cp_master/ibus
+$BIN apply 350 >/dev/null 2>&1
+OUT3=$($BIN dump 2>/dev/null)
+RB=$(echo "$OUT3" | tr ',' '\n' | grep '"real_batt_temp"' | grep -o '[0-9]*$')
+if [ "$RB" != "6400" ]; then
+    ok "ibus=0 时排除了 cp_master 陈旧值 6400（real_batt_temp=$RB）"
+else
+    ng "仍取到 cp_master 陈旧值 6400"
+fi
+# 回退目标必须是独立 NTC（不能被伪装的 charger_therm 冒充）
+if [ -n "$RB" ] && [ "$RB" != "3500" ]; then
+    ok "回退未落到被伪装的 charger_therm（未显示 35.0℃）"
+else
+    ng "回退到了伪装值 3500（35.0℃），语义错误"
+fi
+
+echo ""
+echo "############ O. PID 复用不得误判 daemon 存活 ############"
+build_env /tmp/tcbp12
+D=$R/data/adb/temp_charge_boost
+mkdir -p $D
+# 把 pid 文件写成一个绝对不可能是我们进程的 PID（当前 shell 自己）
+echo $$ > $D/daemon.pid
+OUT4=$($BIN dump 2>/dev/null)
+ALIVE=$(echo "$OUT4" | tr ',' '\n' | grep '"daemon_alive"' | grep -o 'true\|false')
+[ "$ALIVE" = "false" ] && ok "PID 被别的进程复用时正确报告 daemon_alive=false" || ng "PID 复用仍误报 alive=$ALIVE"
+# 清掉 pid 文件也应报 false
+rm -f $D/daemon.pid
+OUT5=$($BIN dump 2>/dev/null)
+ALIVE2=$(echo "$OUT5" | tr ',' '\n' | grep '"daemon_alive"' | grep -o 'true\|false')
+[ "$ALIVE2" = "false" ] && ok "无 pid 文件时报告 daemon_alive=false" || ng "无 pid 文件仍报 alive=$ALIVE2"
+
+echo ""
+echo "############ P. 测试自身卫生：跑完不得留挂载残留 ############"
+# 本组属于"测试基础设施自检"，不是被测代码的功能。
+# 理由：L/N 组曾因上一轮残留 bind mount 导致 build_env 清不掉目录，
+# 于是在空环境里"偶然通过"——脏环境下的 PASS 不算验证。
+KEEP=${TCB_KEEP_ENV:-0}
+if [ "$KEEP" = "1" ]; then
+    echo "  [跳过] TCB_KEEP_ENV=1，保留 /tmp/tcbp* 供人工排查"
+else
+    for r in /tmp/tcbp1 /tmp/tcbp2 /tmp/tcbp3 /tmp/tcbp4 /tmp/tcbp5 /tmp/tcbp6 \
+             /tmp/tcbp7 /tmp/tcbp8 /tmp/tcbp9 /tmp/tcbp10 /tmp/tcbp11 /tmp/tcbp12; do
+        [ -d "$r" ] || continue
+        awk -v p="$r" '$5==p || index($5,p"/")==1 {print $5}' /proc/self/mountinfo 2>/dev/null \
+          | awk '{print length, $0}' | sort -rn | cut -d' ' -f2- \
+          | while read -r m; do umount -l "$m" 2>/dev/null; done
+        rm -rf "$r" 2>/dev/null
+    done
+    # 注意不能用 grep -c：无匹配时它输出 0 且退出码为 1，
+    # 若写成 $(grep -c ... || echo 0) 会得到 "0\n0"（本轮踩坑 P 组自检误报）。
+    LEFT=$(awk '$5 ~ /^\/tmp\/tcbp/ {n++} END {print n+0}' /proc/self/mountinfo 2>/dev/null)
+    [ "$LEFT" = "0" ] && ok "测试结束无挂载残留（/tmp/tcbp* 全部清理）" \
+                      || ng "仍有 $LEFT 个 /tmp/tcbp* 挂载残留"
 fi
 
 echo ""

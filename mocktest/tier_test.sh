@@ -9,14 +9,25 @@ ng(){ FAIL=$((FAIL+1)); echo "  FAIL  $1"; }
 chk(){ if [ "$2" = "$3" ]; then ok "$1 = $2"; else ng "$1 期望[$3] 实际[$2]"; fi; }
 
 # ---- 从源码里抽出真实常量，保证测的是代码里那份 ----
-SRC=${1:-/root/tcb_build/t.cpp}
-PCTS=$(grep -o 'WALL_PCT\[\] = {[^}]*}' $SRC | sed 's/.*{//;s/}.*//;s/ //g')
-PUSH=$(grep -o 'WALL_PUSH_SEC  = [0-9]*' $SRC | grep -o '[0-9]*')
-RELAXC=$(grep -o 'WALL_RELAX_C   = [0-9]*' $SRC | grep -o '[0-9]*')
-echo "从源码读到: WALL_PCT={$PCTS}  PUSH=${PUSH}s  RELAX_C=$RELAXC"
+# ⚠ 定位踩坑（本组曾因此静默失败）：
+#   本文件第一个参数是对外调用约定里的"二进制路径"（与其他测试一致），
+#   曾经写成 SRC=${1:-t.cpp}，于是 bash tier_test.sh ./t_bin 时
+#   SRC=二进制 → grep 常量全落空 → PCTS 为空 → N=0 →
+#   tier_of() 永远返回 0 → A 组全部"PASS"、B/C 组乱报。
+#   教训：解析不到常量时必须直接失败，绝不能退化成默认值继续跑。
+SRC=${2:-${TCB_SRC:-/root/tcb_build/t.cpp}}
+if [ ! -f "$SRC" ]; then echo "  [环境异常] 源码不存在: $SRC"; exit 1; fi
+PCTS=$(grep -o 'WALL_PCT\[\] = {[^}]*}' "$SRC" | sed 's/.*{//;s/}.*//;s/ //g')
+PUSH=$(grep -o 'WALL_PUSH_SEC *= *[0-9]*' "$SRC" | grep -o '[0-9]*')
+RELAXC=$(grep -o 'WALL_RELAX_C *= *[0-9]*' "$SRC" | grep -o '[0-9]*')
+echo "从源码读到（$SRC）: WALL_PCT={$PCTS}  PUSH=${PUSH}s  RELAX_C=$RELAXC"
+# 硬校验：拿不到常量就终止，禁止用空值继续算下去
+if [ -z "$PCTS" ]; then echo "  [环境异常] 未能从源码解析 WALL_PCT，测试无效"; exit 1; fi
+if [ -z "$PUSH" ] || [ -z "$RELAXC" ]; then echo "  [环境异常] 未能解析 WALL_PUSH_SEC / WALL_RELAX_C，测试无效"; exit 1; fi
 IFS=',' read -ra P <<< "$PCTS"
 N=${#P[@]}
 echo "档位数=$N"
+if [ "$N" -lt 2 ]; then echo "  [环境异常] 档位数=$N 不合理，测试无效"; exit 1; fi
 
 # 复刻 wall_tier_from_temp
 tier_of(){ # tier_of <batt_c> <wall_c>
