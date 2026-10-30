@@ -1638,6 +1638,26 @@ static int wall_tier_from_temp(int batt_c, int wall_c) {
 
 // 温度墙运行时状态已在 charge_tick() 之前声明（需要被 charge_tick 引用）
 
+// daemon 是否真的在跑（供短命进程判断能否代跑一次判定）。
+// 判据与 status 一致：pid 文件里的 pid 必须存活，且 /proc/<pid>/cmdline
+// 同时含二进制名和 daemon 子命令 —— 只看 pid 存活会被复用 pid 骗到。
+static bool daemon_running() {
+    char p[128];
+    snprintf(p, sizeof(p), "%s/daemon.pid", WORK_DIR);
+    int pid = 0;
+    if (!read_int(p, &pid) || pid <= 0) return false;
+    char sp[128];
+    snprintf(sp, sizeof(sp), "/proc/%d/cmdline", pid);
+    int fd = open(sp, O_RDONLY | O_CLOEXEC);
+    if (fd < 0) return false;
+    char cb[512] = {0};
+    ssize_t n = read(fd, cb, sizeof(cb) - 1);
+    close(fd);
+    if (n <= 0) return false;
+    for (ssize_t i = 0; i < n; i++) if (cb[i] == '\0') cb[i] = ' ';
+    return strstr(cb, "temp_charge_boost") && strstr(cb, "daemon");
+}
+
 // 每轮调用：充电时执行温度墙判定，必要时写上限；降温后恢复
 // 配置从 wall.conf 读取（"启用 阈值x10" 两字段），WebUI 改完即时生效
 // 温度墙档位 0 = 不限流，此时应解除 IC 级温度限流（OS4）；
@@ -1760,28 +1780,40 @@ static void wall_tick() {
         g_wall_push_at = 0;                    // 温度回落，积分清零
     }
 
-    // 恢复温度：默认 40℃，但必须低于阈值（用户把阈值设到 42℃ 以下时自动让路）
+    // 恢复温度：保留常量仅用于诊断输出，放档判定已改为 need==0（见下方状态机）。
+    // 不再是放档门槛 —— 40℃ 门槛会在正常充电温度(40~45℃)形成死区，见状态机注释。
     int relax_c = WALL_RELAX_C;
     if (relax_c > wall_c - 3000) relax_c = wall_c - 3000;
     if (relax_c < 30000) relax_c = 30000;      // 兜底下限
+    (void)relax_c;                             // 仅作诊断参考，不参与放档判定
 
     // 档位状态机：
     //   升档 —— 立即生效（温度往上走必须马上压住）
-    //   放档 —— 必须降到 relax_c 以下并稳定 WALL_RELAX_SEC 秒，
-    //           然后一次性回到 need（通常是 0 = 满额），不逐档磨。
+    //   放档 —— 温度已回落到阈值以下（need==0）并稳定 WALL_RELAX_SEC 秒，
+    //           然后一次性回到 need（=0 满额），不逐档磨。
+    //
+    // ⚠ 放档条件不能用「bt <= relax_c(40℃)」。
+    //   原实现要求降到 40℃ 以下才放档，而正常充电时电池温度就是 40~45℃，
+    //   于是 40℃ ~ 阈值 之间形成 11℃ 死区：一旦升过档就再也放不回来。
+    //   真机实测（2026-10-30）：阈值临时设为 30℃ 触发升到第 7 档，
+    //   改回 51℃ 后电池 42.6℃ 落在死区，档位永久停在 7 档、
+    //   wired_chg_curr 被压在 3000000(8%)，且 wired_thermal_remove 被压成 0，
+    //   必须等电池真降到 40℃ 以下才自愈 —— 等于充电速度被永久锁死在 3A。
+    //   正确语义：限流只在「温度 >= 阈值」时生效（need>0），
+    //   温度低于阈值即为该放档状态，10 秒稳定期负责防抖。
     int tier = g_wall_tier;
     if (need >= tier) {
         tier = need;                 // 升档或持平：直接跟随
         g_wall_relax_at = 0;
-    } else if (bt <= relax_c) {
-        // 已降到恢复温度以下：计时，稳定够久才允许放档
+    } else if (need == 0) {
+        // 温度已回落到阈值以下：计时，稳定够久才允许放档
         if (g_wall_relax_at == 0) g_wall_relax_at = now;
         if (now - g_wall_relax_at >= WALL_RELAX_SEC) {
             tier = need;             // 一次性放到应有档位
             g_wall_relax_at = 0;
         }
     } else {
-        // 温度仍在恢复点之上：保持当前限流，并清计时
+        // 温度仍在阈值之上但档位偏高：保持当前限流，并清计时
         g_wall_relax_at = 0;
     }
     g_wall_tier = tier;
@@ -2516,7 +2548,18 @@ int main(int argc, char **argv) {
                 // 开启时立刻跑一次判定：让"可信性检查"的诊断日志当场落地，
                 // 否则用户只看到"已开启"，而真正原因要等 daemon 下一轮才写日志，
                 // 容易误以为功能正常（离线测试已复现该困惑）。
-                wall_tick();
+                //
+                // ⚠ wall 命令是独立短进程，g_wall_tier 初值恒为 0，与 daemon 内存态
+                //   完全无关。此处调用 wall_tick() 会用「档位 0」的假状态覆盖 sysfs：
+                //   - daemon 正限流中（tier=7）时，wall 命令会把 wired_thermal_remove
+                //     强行写成 1，而 daemon 下一轮又写回 0 → 每秒拉锯、日志刷屏；
+                //   - 真机实测（2026-10-30 14:54:36）即出现「解除(1) → 恢复(0)」反复。
+                //   正确做法：wall 命令只负责落盘配置 + 打印诊断，实时判定一律交给
+                //   daemon（它持有 g_wall_tier / 计时器 / 持久 fd 这些跨轮状态）。
+                if (daemon_running())
+                    logf("温度墙配置已更新，由 daemon 在下一轮生效");
+                else
+                    wall_tick();   // 无 daemon 时（离线/调试）才允许单次判定
             }
         }
         int wall_curr = 0;
