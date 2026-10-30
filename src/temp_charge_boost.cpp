@@ -55,6 +55,7 @@ static std::string g_n_batt_temp;
 static std::string g_n_usb_online;
 static std::string g_n_batt_stat;
 static std::string g_n_wired_curr;
+static std::string g_n_thermal_rm;   // OS4: wired_thermal_remove（充电温度限制解除标志）
 static std::string g_zone_root;
 static std::string g_zone_class;
 
@@ -84,6 +85,14 @@ static void init_paths() {
     g_n_usb_online = env_or("TCB_USB_ONLINE", R + "/sys/class/power_supply/usb/online");
     g_n_batt_stat  = env_or("TCB_BATT_STAT",  R + "/sys/class/power_supply/battery/status");
     g_n_wired_curr = env_or("TCB_WIRED_CURR", R + "/sys/class/xm_power/charger/charger_thermal/wired_chg_curr");
+    // OS4 新增：内核充电驱动的温度限制解除标志。
+    // 为什么需要它：实测 OS4 上 charge_interface/ichg_limit 显示
+    //   buck eff_client:volt_thermal_limit 3000
+    // 即内核因温度把电流卡在 3A，此时把 wired_chg_curr 抬到 18A/22A 也上不去。
+    // 写 wired_thermal_remove=1 后实测电流从 5.33A → 6.07A（+0.74A），
+    // 说明这是与 wired_chg_curr 并列的第二层限制，必须一并处理。
+    // OS3 无此节点（node_writable 返回 false，profile.thermal_ok=0，自动跳过）。
+    g_n_thermal_rm = env_or("TCB_THERMAL_RM", R + "/sys/class/xm_power/charger/charger_thermal/wired_thermal_remove");
 }
 
 #define WORK_DIR     (g_work.c_str())
@@ -99,8 +108,11 @@ static void init_paths() {
 #define N_USB_ONLINE (g_n_usb_online.c_str())
 #define N_BATT_STAT  (g_n_batt_stat.c_str())
 #define N_WIRED_CURR (g_n_wired_curr.c_str())
+#define N_THERMAL_RM (g_n_thermal_rm.c_str())
 
-static const int  DEF_WIRED_CURR = 22000000;  // 默认满额 22A
+// OS4 实测：wired_chg_curr 抬到 18A 后电流饱和（20A/22A 反而回落），
+// 因此满额取 18A 而非 22A —— 22A 是寄存器允许值，但不是有效上限。
+static const int  DEF_WIRED_CURR = 18000000;  // 默认满额 18A（OS4 实测饱和点）
 static const int  WALL_CAP_CURR  = 3000000;   // 温度墙触顶时压到 3A
 
 static const int  DEF_TEMP      = 350;   // 35.0C
@@ -741,6 +753,7 @@ struct Profile {
     long conn_zone;             // 充电口
     std::string conn_type;
     bool ctrl_ok, pps_ok, cur_ok, fake_ok;
+    bool thermal_ok;            // OS4: wired_thermal_remove 是否可写（OS3 无此节点=0）
     std::string bl_dir;
     int  bl_max;
     std::string stamp;
@@ -773,6 +786,7 @@ static bool save_profile() {
     fprintf(fp, "conn_zone=%ld\n",     g_prof.conn_zone);
     fprintf(fp, "conn_type=%s\n",      g_prof.conn_type.c_str());
     fprintf(fp, "ctrl_ok=%d\n",        g_prof.ctrl_ok ? 1 : 0);
+    fprintf(fp, "thermal_ok=%d\n",     g_prof.thermal_ok ? 1 : 0);
     fprintf(fp, "pps_ok=%d\n",         g_prof.pps_ok ? 1 : 0);
     fprintf(fp, "cur_ok=%d\n",         g_prof.cur_ok ? 1 : 0);
     fprintf(fp, "fake_ok=%d\n",        g_prof.fake_ok ? 1 : 0);
@@ -812,6 +826,7 @@ static bool load_profile() {
         else if (k == "conn_zone")   g_prof.conn_zone = atol(v.c_str());
         else if (k == "conn_type")   g_prof.conn_type = v;
         else if (k == "ctrl_ok")     g_prof.ctrl_ok = atoi(v.c_str()) != 0;
+        else if (k == "thermal_ok")  g_prof.thermal_ok = atoi(v.c_str()) != 0;
         else if (k == "pps_ok")      g_prof.pps_ok  = atoi(v.c_str()) != 0;
         else if (k == "cur_ok")      g_prof.cur_ok  = atoi(v.c_str()) != 0;
         else if (k == "fake_ok")     g_prof.fake_ok = atoi(v.c_str()) != 0;
@@ -1033,6 +1048,11 @@ static int do_scan(bool verbose) {
     g_prof.pps_ok     = node_writable(N_PPS_PTF);
     g_prof.cur_ok     = node_writable(N_WIRED_CURR);
     g_prof.fake_ok    = node_writable(N_FAKE_TEMP);
+    // OS4 新增：wired_thermal_remove 是「充电温度限制解除」开关。
+    //   写 1 = 解除 IC 级温度限流，实测电流 5.33A → 6.07A（+0.74A）；
+    //   写 0 = 恢复厂商默认限流。
+    // OS3 无此节点 → node_writable 返回 false → thermal_ok=0 → 全流程自动跳过。
+    g_prof.thermal_ok = node_writable(N_THERMAL_RM);
     {
         char ts[32];
         time_t now = time(nullptr);
@@ -1168,6 +1188,15 @@ static int apply_temp(int want) {
     // 充电提速节点
     write_int(N_CTRL_LIMIT, 0);
     write_int(N_PPS_PTF, 1);
+
+    // OS4：解除 IC 级充电温度限流（OS3 无此节点，thermal_ok=0 自动跳过）。
+    // 这是实测最有效的提速手段：+0.74A，且不需要改 wired_chg_curr 的档位。
+    if (g_prof.thermal_ok) {
+        if (write_int(N_THERMAL_RM, 1))
+            logf("[apply] 已解除充电温度限流 (wired_thermal_remove=1)");
+        else
+            logf("[apply] 警告：解除充电温度限流失败 (%s)", N_THERMAL_RM);
+    }
 
     // 挂载完成后写入真实值快照（供 WebUI 跨进程读取）
     flush_real_values();
@@ -1489,6 +1518,16 @@ static bool is_charging() {
     return false;
 }
 
+// 温度墙运行时状态（全部内存态）。
+// 不能拿「读 sysfs 当前值」当反馈来计算目标：charger 驱动写后不一定立即回读一致，
+// 一秒钟内读到旧值就会让目标值在 6.6A / 11A 之间反复横跳（实测出现过拉锯）。
+// ⚠ 声明必须早于 charge_tick()：cheap_tick 里要用 g_wall_tier 判断是否维持
+//   wired_thermal_remove=1，late 声明会导致编译期「未声明标识符」。
+static int  g_wall_tier     = 0;   // 当前生效档位
+static long g_wall_push_at  = 0;   // 超阈值计时起点（0=未计时）
+static long g_wall_relax_at = 0;   // 回落计时起点（0=未计时）
+static int  g_wall_last     = -1;  // 上次写入的电流值
+
 static void charge_tick() {
     // 只在充电时纠正限流档
     int cur = -1;
@@ -1499,6 +1538,15 @@ static void charge_tick() {
     int ft = 0;
     if (read_int(N_FAKE_TEMP, &ft)) {
         if (ft != DEF_TEMP) write_int(N_FAKE_TEMP, DEF_TEMP);
+    }
+    // OS4：wired_thermal_remove 可能被充电 IC 固件或 mi_thermald 重置为 0，
+    // 每轮自愈回 1（幂等写，值已为 1 时不重复写，避免无谓 sysfs 写）。
+    // 温度墙要降档时由 wall_tick 负责临时置 0，这里不能无条件覆盖 ——
+    // 因此只在「温度墙当前处于 0 档（不限流）」时才维持 removal=1。
+    if (g_prof.thermal_ok && g_wall_tier == 0) {
+        int rm = -1;
+        if (read_int(N_THERMAL_RM, &rm) && rm != 1)
+            write_int(N_THERMAL_RM, 1);
     }
 }
 
@@ -1588,16 +1636,24 @@ static int wall_tier_from_temp(int batt_c, int wall_c) {
     return t;
 }
 
-// 温度墙运行时状态（全部内存态）。
-// 不能拿「读 sysfs 当前值」当反馈来计算目标：charger 驱动写后不一定立即回读一致，
-// 一秒钟内读到旧值就会让目标值在 6.6A / 11A 之间反复横跳（实测出现过拉锯）。
-static int  g_wall_tier     = 0;   // 当前生效档位
-static long g_wall_push_at  = 0;   // 超阈值计时起点（0=未计时）
-static long g_wall_relax_at = 0;   // 回落计时起点（0=未计时）
-static int  g_wall_last     = -1;  // 上次写入的电流值
+// 温度墙运行时状态已在 charge_tick() 之前声明（需要被 charge_tick 引用）
 
 // 每轮调用：充电时执行温度墙判定，必要时写上限；降温后恢复
 // 配置从 wall.conf 读取（"启用 阈值x10" 两字段），WebUI 改完即时生效
+// 温度墙档位 0 = 不限流，此时应解除 IC 级温度限流（OS4）；
+// 档位 > 0 = 正在限流，必须让 IC 级限流也生效，否则软件限流被硬件绕过。
+// OS3 无此节点（thermal_ok=0）→ 全部空操作。
+static void wall_sync_thermal_rm(int tier) {
+    if (!g_prof.thermal_ok) return;
+    int want = (tier == 0) ? 1 : 0;
+    int cur = -1;
+    if (read_int(N_THERMAL_RM, &cur) && cur == want) return;   // 幂等，不重复写
+    if (write_int(N_THERMAL_RM, want))
+        logf("充电温度限流: %s (wired_thermal_remove=%d)", want ? "解除" : "恢复", want);
+    else
+        logf("警告：写 wired_thermal_remove=%d 失败", want);
+}
+
 static void wall_tick() {
     // 读配置：enabled wall_c [force_trust]
     int enabled = 1, wall_c = 51000, force_trust = 0;
@@ -1625,6 +1681,7 @@ static void wall_tick() {
             logf("温度墙关闭，恢复充电电流 %d", cap);
         }
         g_wall_tier = 0; g_wall_push_at = 0; g_wall_relax_at = 0; g_wall_last = -1;
+        wall_sync_thermal_rm(0);
         return;
     }
 
@@ -1672,6 +1729,7 @@ static void wall_tick() {
             logf("温度墙不可信，恢复充电电流 %d", cap);
         }
         g_wall_tier = 0; g_wall_push_at = 0; g_wall_relax_at = 0; g_wall_last = -1;
+        wall_sync_thermal_rm(0);
         return;
     }
 
@@ -1739,11 +1797,15 @@ static void wall_tick() {
                  bt / 1000, (bt % 1000) / 100, cap);
         }
         g_wall_last = -1;
+        wall_sync_thermal_rm(0);
         return;
     }
 
     int want = cap * WALL_PCT[tier] / 100;
     if (want < WALL_CAP_CURR) want = WALL_CAP_CURR;   // 不低于 3A，避免触发涓流停充
+
+    // 限流生效时，IC 级温度限流必须恢复，否则硬件会绕过软件限流继续拉满电流
+    wall_sync_thermal_rm(tier);
 
     // 与「上次写入值」比较，而非与 sysfs 当前值比较，避免反馈回路。
     int deadband = cap * 2 / 100;

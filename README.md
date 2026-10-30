@@ -147,6 +147,40 @@ temp_charge_boost log [行数]           # 日志尾部
 > 第 3 步是关键：若卸载时温度墙正在限流，不恢复电流会让充电永久卡在最低 3A，用户很难自查。
 
 ## 版本历史
+### v1.3.3 (2026-10-30)
+
+OS4（OS4.0.5.0.XGNCNXM / Android 17）充电限流适配。**全部基于真机实测，含 mock 回归**。
+
+OS4 把充电限流拆成了三层，模块原先只碰最外层那一个节点，实测提速效果不足：
+
+| 层 | 节点 | 性质 |
+|---|---|---|
+| 硬件层 | `charger_thermal/wired_chg_curr` | 可写，寄存器上限 15.6A |
+| **IC 层** | **`charger_thermal/wired_thermal_remove`** | **可写，OS4 新增，本次接入** |
+| 内核层 | `charge_interface/ichg_limit` | 只读动态状态报告，bind mount 无效（已证伪） |
+
+- ✨ **新增 `wired_thermal_remove` 支持**：写 1 解除 IC 级温度限流，实测电流 5.33A → 6.07A（+0.74A）。
+  这是实测最有效的单点手段，且不需要动 `wired_chg_curr` 档位。
+- 🔧 **`DEF_WIRED_CURR` 从 22A 改为 18A**：OS4 实测 18A 是饱和点，20A/22A 反而回落（寄存器允许 ≠ 有效上限）。
+- 🔧 **温度墙与 IC 限流联动**：档位 0（不限流）写 `rm=1`；档位 >0 写 `rm=0`。
+  否则软件限流会被硬件绕过——这是逻辑正确性问题，不是优化项。
+- 🔧 **`charge_tick` 自愈**：充电 IC 固件或 mi_thermald 会重置该节点，每轮检查并恢复（幂等写，值已正确时跳过，不刷 sysfs）。
+- 🔧 **`scan` 新增 `thermal_ok` 探测**，写入 `profile.conf`；OS3 无此节点 → `node_writable` 返回 false → 自动跳过，零副作用。
+
+**mock 回归（4 个场景全过）**
+
+| 场景 | 输入 | 期望 | 实测 |
+|---|---|---|---|
+| scan 自动适配 | mock 6 zone | `thermal_ok=1`，跳过 mdmss/pa_therm | ✅ 4 可伪装 / 2 跳过 |
+| apply 写入 | rm 初值 0 | rm=1 | ✅ 0 → 1 |
+| 高温降档 | zone2=56000（56℃），阈值 51℃ | rm=0，curr=3A | ✅ rm=0，18000000→3000000（第 7 档） |
+| 低温恢复 | zone2=38000（38℃） | rm=1，curr=18A | ✅ rm=1，3000000→18000000 |
+
+编译：`g++ -std=c++17 -O2 -s -static` → 865856 B，`-Wall` 零新增告警。
+
+> 注：`g_wall_tier` / `g_wall_push_at` / `g_wall_relax_at` / `g_wall_last` 四个变量的声明
+> 从温度墙区上移到 `charge_tick()` 之前——`charge_tick` 需要读 `g_wall_tier` 判断是否
+> 维持 `rm=1`，late 声明会直接编译失败。
 ### v1.3.2 (2026-10-29)
 补 v1.3.1 漏改的同类缺陷——**部署到真机后实测发现，不靠推断**。
 

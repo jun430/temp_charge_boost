@@ -1,6 +1,6 @@
 id=temp_charge_boost
 name=温度伪装 · 充电提速
-version=v1.3.2
-versionCode=132
+version=v1.3.3
+versionCode=133
 author=雨色
 description=通过 bind mount 伪装系统温度节点，解除充电限流并附带充电温度墙与屏幕亮度调节。安装时自动扫描本机温度节点，按实测语义判定电池真实温度源（OS3/OS4 候选顺序自适应）；无独立 NTC 时自动停用温度墙，避免用假值控温。支持 KernelSU WebUI 查看温度、调节阈值与日志，安装与卸载均有完整还原。
