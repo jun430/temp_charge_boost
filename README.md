@@ -199,8 +199,11 @@ temp_charge_boost log [行数]           # 日志尾部
 安装过程会做三道门禁检查，不满足直接中止并提示原因：
 
 1. 架构必须是 arm64（二进制为 arm64-v8a）
-2. 必须存在 `/sys/devices/virtual/thermal` 与 `xm_power` 的 `fake_temp`
+2. 必须存在 `/sys/devices/virtual/thermal`（温度伪装的对象，无替代）
 3. 安装包内二进制必须存在
+
+充电节点（`xm_power` 那套）**不参与门禁**：它们由主程序的语义探测解析，
+探测不到就自动降级为「仅温度伪装」，不会因此中断安装。
 
 随后自动扫描本机温度节点，按实测语义判定电池真实温度源，结果写入 `/data/adb/temp_charge_boost/profile.conf`，安装日志同目录下 `install.log`（出问题直接贴这个文件）。
 
@@ -219,6 +222,35 @@ temp_charge_boost log [行数]           # 日志尾部
 > 第 3 步是关键：若卸载时温度墙正在限流，不恢复电流会让充电永久卡在最低 3A，用户很难自查。
 
 ## 版本历史
+### v1.4.1 (2026-11-04)
+**修复安装脚本的硬编码残留**。v1.4.0 只把主程序的充电节点改成了语义探测，
+但 `customize.sh` 的门禁 2 与 `uninstall.sh` 的还原逻辑仍各自写死着绝对路径，
+导致换 ROM / 节点改名时**安装直接被 abort**，主程序的探测能力根本来不及生效。
+
+- 🐛 **`customize.sh` 门禁 2 不再硬编码**：删除 `/sys/class/xm_power/fuelgauge/strategy_fg/fake_temp`
+  存在性检查。原来缺这一个节点就 `abort`，等于让语义探测形同虚设
+- 🐛 **降级而不是阻断**：现在只有「无 thermal 子系统」才 abort（功能根基，无替代）；
+  充电体系（`/sys/class/xm_power` 或 `/sys/class/power_supply`）缺失时只提示，
+  自动降级为「仅温度伪装」，安装照常完成
+- 🐛 **`uninstall.sh` 改为读语义解析结果**：三个充电节点 + `fake_temp` 不再写死，
+  优先从 `profile.conf` 的 `node_*` 行取主程序探测到的真实路径；
+  profile 缺失时回退已知路径，再不命中则按名字在充电体系内枚举兜底
+- ✨ **`profile.conf` 新增 8 条 `node_*` 记录**：主程序把语义探测后的最终落点落盘，
+  shell 脚本直接读取，不再维护第二套路径知识
+- 🔧 `abort` 调用点从 5 处减到 4 处（架构 / 无 thermal / 缺二进制 / 用户取消）
+
+**验证（离线，不碰真机）**
+
+| 项 | 结果 |
+|---|---|
+| `customize.sh` 全文无 `fake_temp` 硬编码 | ✅ |
+| 仍保留 thermal 子系统硬门禁 | ✅ |
+| 充电体系缺失时仅提示、不 abort | ✅ |
+| `uninstall.sh` 四个节点均从 profile 读取 | ✅ |
+| 改名场景（`charger_thermal` → `chgx`）卸载还原 | ✅ 四值全部写对 |
+| profile 缺失时 `pf_get` 返回空、不误写 | ✅ |
+| 两个脚本 `sh -n` 语法检查 | ✅ |
+
 ### v1.4.0 (2026-11-04)
 充电节点从**硬编码**改为**语义探测**。原有 8 个节点的绝对路径降级为「参考候选」，
 路径不存在时自动在 `/sys/class/{power_supply,xm_power,thermal}` 内按语义打分寻找等价节点。

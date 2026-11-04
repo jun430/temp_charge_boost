@@ -1130,6 +1130,16 @@ static bool save_profile() {
     fprintf(fp, "bl_dir=%s\n",         g_prof.bl_dir.c_str());
     fprintf(fp, "bl_max=%d\n",         g_prof.bl_max);
     fprintf(fp, "stamp=%s\n",          g_prof.stamp.c_str());
+    // 节点最终解析路径（语义探测后的真实落点）——供 shell 脚本读取，
+    // 避免 customize.sh / uninstall.sh 再写一套硬编码路径。
+    fprintf(fp, "node_fake_temp=%s\n",  g_n_fake_temp.c_str());
+    fprintf(fp, "node_ctrl_limit=%s\n", g_n_ctrl_limit.c_str());
+    fprintf(fp, "node_pps_ptf=%s\n",    g_n_pps_ptf.c_str());
+    fprintf(fp, "node_batt_temp=%s\n",  g_n_batt_temp.c_str());
+    fprintf(fp, "node_usb_online=%s\n", g_n_usb_online.c_str());
+    fprintf(fp, "node_batt_stat=%s\n",  g_n_batt_stat.c_str());
+    fprintf(fp, "node_wired_curr=%s\n", g_n_wired_curr.c_str());
+    fprintf(fp, "node_thermal_rm=%s\n", g_n_thermal_rm.c_str());
     fclose(fp);
     return true;
 }
@@ -1170,6 +1180,18 @@ static bool load_profile() {
         else if (k == "bl_dir")      g_prof.bl_dir = v;
         else if (k == "bl_max")      g_prof.bl_max = atoi(v.c_str());
         else if (k == "stamp")       g_prof.stamp = v;
+        // 节点路径回填：profile 存的是上次 scan 的结果；
+        // init_paths 已解析出的路径优先（非空则不覆盖）。
+        else if (k.compare(0, 5, "node_") == 0) {
+            if      (k == "node_fake_temp")  { if (g_n_fake_temp.empty())  g_n_fake_temp  = v; }
+            else if (k == "node_ctrl_limit") { if (g_n_ctrl_limit.empty()) g_n_ctrl_limit = v; }
+            else if (k == "node_pps_ptf")    { if (g_n_pps_ptf.empty())    g_n_pps_ptf    = v; }
+            else if (k == "node_batt_temp")  { if (g_n_batt_temp.empty())  g_n_batt_temp  = v; }
+            else if (k == "node_usb_online") { if (g_n_usb_online.empty()) g_n_usb_online = v; }
+            else if (k == "node_batt_stat")  { if (g_n_batt_stat.empty())  g_n_batt_stat  = v; }
+            else if (k == "node_wired_curr") { if (g_n_wired_curr.empty()) g_n_wired_curr = v; }
+            else if (k == "node_thermal_rm") { if (g_n_thermal_rm.empty()) g_n_thermal_rm = v; }
+        }
     }
     fclose(fp);
     return g_prof.ver > 0;

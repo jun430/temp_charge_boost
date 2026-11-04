@@ -81,12 +81,42 @@ done
 #    原脚本缺失的关键一步：卸载时若温度墙正在限流，
 #    充电电流上限会永久停在限流值（最低 3A），必须恢复满额。
 # ============================================================
-CUR_NODE=/sys/class/xm_power/charger/charger_thermal/wired_chg_curr
-CTRL_NODE=/sys/class/xm_power/charger/charger_thermal/wired_ctrl_limit
-PPS_NODE=/sys/class/xm_power/charger/quick_charge/fake_pps_ptf
+# 节点路径来自主程序的语义探测结果（profile.conf 的 node_* 行），
+# 不再写死 xm_power 的绝对路径 —— 换 ROM / 改名后卸载同样能正确还原。
+PROFILE="$WD/profile.conf"
+pf_get() {
+    [ -f "$PROFILE" ] || return 1
+    sed -n "s/^$1=//p" "$PROFILE" 2>/dev/null | head -1
+}
+
+# 优先用 profile；profile 缺失时依次回退到已知路径与语义枚举
+CUR_NODE=$(pf_get node_wired_curr)
+CTRL_NODE=$(pf_get node_ctrl_limit)
+PPS_NODE=$(pf_get node_pps_ptf)
+
+# 兜底：profile 里没有（旧版本升级卸装）时按已知路径找
+[ -n "$CUR_NODE" ]  || CUR_NODE=/sys/class/xm_power/charger/charger_thermal/wired_chg_curr
+[ -n "$CTRL_NODE" ] || CTRL_NODE=/sys/class/xm_power/charger/charger_thermal/wired_ctrl_limit
+[ -n "$PPS_NODE" ]  || PPS_NODE=/sys/class/xm_power/charger/quick_charge/fake_pps_ptf
+
+# 再兜底：已知路径也不存在时，在充电体系内按名字枚举（不写死目录名）
+find_chg_node() {
+    _want="$1"
+    for _base in /sys/class/xm_power /sys/class/power_supply; do
+        [ -d "$_base" ] || continue
+        _r=$(find "$_base" -maxdepth 3 -name "$_want" -type f 2>/dev/null | head -1)
+        [ -n "$_r" ] && { echo "$_r"; return 0; }
+    done
+    return 1
+}
+[ -e "$CUR_NODE" ]  || CUR_NODE=$(find_chg_node wired_chg_curr)
+[ -e "$CTRL_NODE" ] || CTRL_NODE=$(find_chg_node wired_ctrl_limit)
+[ -e "$PPS_NODE" ]  || PPS_NODE=$(find_chg_node fake_pps_ptf)
+
+log "充电节点: curr=${CUR_NODE:-未找到} ctrl=${CTRL_NODE:-未找到} pps=${PPS_NODE:-未找到}"
 FULL_CURR=22000000
 
-if [ -e "$CUR_NODE" ]; then
+if [ -n "$CUR_NODE" ] && [ -e "$CUR_NODE" ]; then
     C=$(cat "$CUR_NODE" 2>/dev/null)
     log "卸载前充电电流上限=$C"
     echo "$FULL_CURR" > "$CUR_NODE" 2>/dev/null
@@ -99,11 +129,11 @@ if [ -e "$CUR_NODE" ]; then
 fi
 
 # wired_ctrl_limit 归 0（模块运行时会写 0 放开控制）
-if [ -e "$CTRL_NODE" ]; then
+if [ -n "$CTRL_NODE" ] && [ -e "$CTRL_NODE" ]; then
     echo 0 > "$CTRL_NODE" 2>/dev/null && log "wired_ctrl_limit 归 0"
 fi
 # fake_pps_ptf 归 1（模块运行时会写 1）
-if [ -e "$PPS_NODE" ]; then
+if [ -n "$PPS_NODE" ] && [ -e "$PPS_NODE" ]; then
     echo 1 > "$PPS_NODE" 2>/dev/null && log "fake_pps_ptf 归 1"
 fi
 
@@ -146,8 +176,10 @@ fi
 # ============================================================
 # 5. 恢复官方伪装接口为未启用（-999 = 关闭）
 # ============================================================
-FAKE=/sys/class/xm_power/fuelgauge/strategy_fg/fake_temp
-if [ -e "$FAKE" ]; then
+FAKE=$(pf_get node_fake_temp)
+[ -n "$FAKE" ] || FAKE=/sys/class/xm_power/fuelgauge/strategy_fg/fake_temp
+[ -e "$FAKE" ] || FAKE=$(find_chg_node fake_temp)
+if [ -n "$FAKE" ] && [ -e "$FAKE" ]; then
     echo -999 > "$FAKE" 2>/dev/null
     log "fake_temp 归 -999（未启用）"
 fi

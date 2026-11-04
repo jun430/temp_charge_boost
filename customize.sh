@@ -79,20 +79,37 @@ fi
 log_ok "架构检查通过: $ARCH"
 
 # ============================================================
-# 门禁 2：必需节点
+# 门禁 2：必需节点（语义化）
+#
+# 只有「温度子系统」是硬性前提：没有 thermal_zone 就没有伪装对象，
+# 这是功能根基，不存在语义替代。
+#
+# 充电节点不再做硬编码存在性检查。原因：
+#   - 各 ROM / 机型节点名与目录结构不同（wired_chg_curr / chg_curr_limit…）
+#   - 主程序已实现三级解析（环境变量 → 已知路径 → 语义探测 + 别名 + 模糊匹配）
+# 所以这里改成：调用一次 scan，看它探测到什么；探测不到就降级为「只伪装温度」，
+# 而不是直接把安装打断 —— 安装失败比缺一个充电功能更糟。
 # ============================================================
 if [ ! -d /sys/devices/virtual/thermal ]; then
     ui_print "× 找不到 thermal 子系统"
     log_error "/sys/devices/virtual/thermal 不存在"
     abort "本机没有 thermal_zone，温度伪装无法工作。"
 fi
-if [ ! -e /sys/class/xm_power/fuelgauge/strategy_fg/fake_temp ]; then
-    ui_print "× 找不到小米充电官方伪装接口"
-    ui_print "  /sys/class/xm_power/fuelgauge/strategy_fg/fake_temp"
-    log_error "fake_temp 不存在"
-    abort "本模块依赖澎湃 OS 的 xm_power 充电接口，当前系统不受支持。"
+log_ok "温度子系统检查通过"
+
+# 充电节点：只提示，不阻断
+CHG_FOUND=0
+for _c in /sys/class/xm_power /sys/class/power_supply; do
+    [ -d "$_c" ] && CHG_FOUND=1
+done
+if [ "$CHG_FOUND" = "1" ]; then
+    log_ok "充电体系存在（具体节点由语义探测决定）"
+else
+    ui_print "⚠ 未发现 power_supply / xm_power 体系"
+    ui_print "  充电提速功能将不可用，温度伪装不受影响"
+    log_warn "无充电体系，充电功能将停用"
 fi
-log_ok "必需节点检查通过"
+log_ok "必需节点检查通过（语义化）"
 
 # ============================================================
 # 门禁 3：二进制可执行
@@ -185,11 +202,11 @@ printf '350\n' > "$WD/target.conf" 2>/dev/null
 # 首次扫描（生成 profile.conf，行为与 apply 自动扫描一致）
 # ============================================================
 ui_print "- 正在扫描温度节点并判定语义..."
-ui_print "  （会短暂读取 fake_temp，测完自动还原，不残留）"
+ui_print "  （会短暂读取温度注入点，测完自动还原，不残留）"
 log_info "执行首次 scan"
 
 # 注意：此处在安装阶段（recovery/管理器环境），sysfs 可读。
-# scan 只读 + 短暂写 fake_temp 后恢复，不改伪装状态。
+# scan 只读 + 短暂写温度注入点后恢复，不改伪装状态。
 SCAN_OUT=$("$BIN" scan 2>&1)
 SCAN_RC=$?
 echo "$SCAN_OUT" >> "$INSTALL_LOG" 2>/dev/null
