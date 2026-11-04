@@ -64,6 +64,91 @@ static std::string env_or(const char *k, const std::string &def) {
     return (v && *v) ? std::string(v) : def;
 }
 
+// ============ 充电节点别名表 ============
+//
+// 这些是「名字不同但语义等价」的候选。来源：AOSP power_supply 标准属性名、
+// 高通 mca 充电驱动、小米 xm_power 私有节点的常见变体写法。
+// 只收确定等价的，不做臆测 —— 写错充电节点的代价可能是过充。
+static const char *AL_WIRED_CHG_CURR[] = {
+    "wired_chg_curr",        // 小米 OS3/OS4 现名
+    "wired_charge_current",
+    "chg_curr_limit",
+    "charging_current_limit",
+    "fast_chg_current",
+    "batt_chg_curr",
+    nullptr
+};
+static const char *AL_WIRED_THERMAL_RM[] = {
+    "wired_thermal_remove",
+    "thermal_remove",
+    "wired_temp_limit_remove",
+    "chg_thermal_remove",
+    nullptr
+};
+static const char *AL_WIRED_CTRL_LIMIT[] = {
+    "wired_ctrl_limit",
+    "wired_ctrl",
+    "chg_ctrl_limit",
+    "charger_ctrl_limit",
+    nullptr
+};
+static const char *AL_PPS_PTF[] = {
+    "fake_pps_ptf",
+    "pps_ptf",
+    "fake_pps_passthrough",
+    "pps_passthrough",
+    nullptr
+};
+static const char *AL_FAKE_TEMP[] = {
+    "fake_temp",
+    "fake_temperature",
+    "emul_temp",
+    "sim_temp",
+    "simulate_temp",
+    nullptr
+};
+
+// ============ 充电节点语义探测（声明部分）============
+//
+// 为什么结构体放这里：init_paths() 在 main 最开头就要实例化 CNodeSpec，
+// 结构体定义必须先于它；函数体（cn_resolve / cn_collect）则放在 struct Profile
+// 之前 —— 那里才能用到 read_int() / logf() 这些后置定义的函数。
+//
+// 8 个充电/状态节点原来是硬编码完整路径。换机型或换 OS 版本只要路径变一个字，
+// 功能就静默失效（profile 只剩 thermal_ok=0，用户不知道"开了没效果"）。
+// 现在改为三级解析，已知路径降级为「候选之一」：
+//   ① 环境变量 TCB_xxx（用户显式指定，最高优先）
+//   ② 已知完整路径（原硬编码值，命中即止）
+//   ③ 枚举白名单目录，按语义打分挑选（同名 + 目录亲和 + 值可读 + 可写）
+struct CNodeSpec {
+    const char *env_key;        // 环境变量覆盖名（保持兼容）
+    const char *name;           // 节点文件名（精确匹配依据）
+    const char *desc;           // 日志用中文名
+    // 该节点「应该」所在的目录特征串（强语义约束）。
+    // 为什么需要它：只按文件名匹配会被同名干扰项骗到 ——
+    // 实测 /sys/class/power_supply/xxx/wired_chg_curr 与
+    //      /sys/class/xm_power/charger/xxx/wired_chg_curr 同名，
+    // 若只做"通用目录加分"，两者同分，先枚举者胜出，会选错节点。
+    const char *hint;
+    // 别名表（nullptr 结尾）。用于「不同名但语义相同」的节点：
+    //   不同 OS 版本 / 不同厂商可能把 wired_chg_curr 叫成 chg_curr_limit、
+    //   fast_chg_current 等，精确匹配会 miss，导致功能静默失效。
+    //   别名按精确相等匹配（L2，+85），比模糊匹配可靠。
+    const char *const *alias;
+    // 模糊匹配主关键词（nullptr = 禁用模糊匹配）。
+    //   文件名包含/前缀/后缀该词即算候选（L3~L5，+70/+55/+50）。
+    //   必须与 hint 目录同时命中才算数 —— 模糊匹配误伤面大，
+    //   没有目录二次确认就一律淘汰，宁可不控也不写错节点。
+    const char *kw;
+};
+
+// 解析单个节点：known 为已知完整路径（已拼好 g_root 前缀）。
+// 返回最终路径；全部未命中返回空串（调用方保留 fallback 并靠 ok 标志禁用功能）。
+static std::string cn_resolve(const CNodeSpec &spec, const std::string &known);
+
+// 未命中的节点（描述 | 回退路径），scan 阶段统一打日志
+static std::vector<std::string> g_cn_miss;
+
 // 把所有路径初始化好。必须在 main 最开头调用一次。
 static void init_paths() {
     // TCB_ROOT 只影响 sysfs 那部分，工作目录单独用 TCB_WORK 覆盖
@@ -78,21 +163,76 @@ static void init_paths() {
     g_zone_root  = env_or("TCB_ZONE_ROOT",  R + "/sys/devices/virtual/thermal");
     g_zone_class = env_or("TCB_ZONE_CLASS", R + "/sys/class/thermal");
 
-    g_n_fake_temp  = env_or("TCB_FAKE_TEMP",  R + "/sys/class/xm_power/fuelgauge/strategy_fg/fake_temp");
-    g_n_ctrl_limit = env_or("TCB_CTRL_LIMIT", R + "/sys/class/xm_power/charger/charger_thermal/wired_ctrl_limit");
-    g_n_pps_ptf    = env_or("TCB_PPS_PTF",    R + "/sys/class/xm_power/charger/quick_charge/fake_pps_ptf");
-    g_n_batt_temp  = env_or("TCB_BATT_TEMP",  R + "/sys/class/power_supply/battery/temp");
-    g_n_usb_online = env_or("TCB_USB_ONLINE", R + "/sys/class/power_supply/usb/online");
-    g_n_batt_stat  = env_or("TCB_BATT_STAT",  R + "/sys/class/power_supply/battery/status");
-    g_n_wired_curr = env_or("TCB_WIRED_CURR", R + "/sys/class/xm_power/charger/charger_thermal/wired_chg_curr");
-    // OS4 新增：内核充电驱动的温度限制解除标志。
-    // 为什么需要它：实测 OS4 上 charge_interface/ichg_limit 显示
-    //   buck eff_client:volt_thermal_limit 3000
-    // 即内核因温度把电流卡在 3A，此时把 wired_chg_curr 抬到 18A/22A 也上不去。
-    // 写 wired_thermal_remove=1 后实测电流从 5.33A → 6.07A（+0.74A），
-    // 说明这是与 wired_chg_curr 并列的第二层限制，必须一并处理。
-    // OS3 无此节点（node_writable 返回 false，profile.thermal_ok=0，自动跳过）。
-    g_n_thermal_rm = env_or("TCB_THERMAL_RM", R + "/sys/class/xm_power/charger/charger_thermal/wired_thermal_remove");
+    // ============ 充电/状态节点：语义探测（不再硬编码）============
+    //
+    // 每个节点走三级解析：环境变量 → 已知路径 → 语义枚举打分。
+    // 已知路径只是候选之一：命中即用；未命中则自动去找"同名的、目录最像的、值可读的"节点。
+    // 全部落空时保留已知路径并让对应 ok 标志为 0，功能自动禁用而不是误写别的节点。
+    // 注意：这里不能调 logf()（它定义在本文件后段），
+    // 未命中的信息先攒进 g_cn_miss 列表，等 do_scan 阶段统一输出。
+    #define CN_DEFINE(var, envk, knownsub, nm, dsc, hnt, als, kwd)          \
+        do {                                                                \
+            CNodeSpec sp;                                                   \
+            sp.env_key = envk; sp.name = nm; sp.desc = dsc; sp.hint = hnt;   \
+            sp.alias = als; sp.kw = kwd;                                     \
+            var = cn_resolve(sp, R + knownsub);                             \
+            if (var.empty()) {                                              \
+                var = R + knownsub;   /* 保留原值，靠 ok 标志禁用功能 */      \
+                g_cn_miss.push_back(std::string(dsc) + " | " + var);         \
+            }                                                               \
+        } while (0)
+
+    // fake_temp：fuelgauge 的模拟温度注入点（伪装链路核心开关）
+    CN_DEFINE(g_n_fake_temp,  "TCB_FAKE_TEMP",
+              "/sys/class/xm_power/fuelgauge/strategy_fg/fake_temp",
+              "fake_temp", "伪温度注入点", "/strategy_fg/",
+              AL_FAKE_TEMP, "fake_temp");
+
+    // wired_ctrl_limit：充电控制器接管开关（0 = 脱离系统策略）
+    CN_DEFINE(g_n_ctrl_limit, "TCB_CTRL_LIMIT",
+              "/sys/class/xm_power/charger/charger_thermal/wired_ctrl_limit",
+              "wired_ctrl_limit", "充电控制器限值", "/charger_thermal",
+              AL_WIRED_CTRL_LIMIT, "ctrl_limit");
+
+    // fake_pps_ptf：PPS 直通伪装标志
+    CN_DEFINE(g_n_pps_ptf,    "TCB_PPS_PTF",
+              "/sys/class/xm_power/charger/quick_charge/fake_pps_ptf",
+              "fake_pps_ptf", "PPS 直通伪装", "/quick_charge/",
+              AL_PPS_PTF, "pps_ptf");
+
+    // 电池温度：标准 power_supply 体系，跨版本最稳定
+    CN_DEFINE(g_n_batt_temp,  "TCB_BATT_TEMP",
+              "/sys/class/power_supply/battery/temp",
+              "temp", "电池温度", "/power_supply/battery",
+              nullptr, nullptr);   // 标准属性名，不做模糊匹配：temp 太泛易误伤
+
+    // USB 在线状态
+    CN_DEFINE(g_n_usb_online, "TCB_USB_ONLINE",
+              "/sys/class/power_supply/usb/online",
+              "online", "USB 在线状态", "/power_supply/usb/",
+              nullptr, nullptr);
+
+    // 电池充电状态
+    CN_DEFINE(g_n_batt_stat,  "TCB_BATT_STAT",
+              "/sys/class/power_supply/battery/status",
+              "status", "电池充电状态", "/power_supply/battery",
+              nullptr, nullptr);
+
+    // wired_chg_curr：mi_thermald 的 thermal_fcc_override 目标节点，
+    // 温度墙限流写的就是它 —— 整个模块最关键的充电控制点。
+    CN_DEFINE(g_n_wired_curr, "TCB_WIRED_CURR",
+              "/sys/class/xm_power/charger/charger_thermal/wired_chg_curr",
+              "wired_chg_curr", "充电电流上限", "/charger_thermal",
+              AL_WIRED_CHG_CURR, "chg_curr");
+
+    // wired_thermal_remove：OS4 新增的 IC 级温度限流解除标志。
+    // 写 1 实测电流 5.33A → 6.07A（+0.74A）；OS3 无此节点 → 探测失败 → 自动跳过。
+    CN_DEFINE(g_n_thermal_rm, "TCB_THERMAL_RM",
+              "/sys/class/xm_power/charger/charger_thermal/wired_thermal_remove",
+              "wired_thermal_remove", "IC 温度限流解除", "/charger_thermal",
+              AL_WIRED_THERMAL_RM, "thermal_remove");
+
+    #undef CN_DEFINE
 }
 
 #define WORK_DIR     (g_work.c_str())
@@ -729,6 +869,203 @@ static bool node_readable(const std::string &p) {
     return access(p.c_str(), R_OK) == 0;
 }
 
+// ============ 充电节点语义探测 ============
+//
+// 为什么需要这套东西：
+//   原实现把 8 个充电/状态节点写死成完整路径，换机型或换 OS 版本只要路径一变，
+//   功能就静默失效（profile 里只剩一行 thermal_ok=0，用户不知道"开了没效果"）。
+//   温度 zone 那部分早就是"枚举 + type 匹配 + 扰动实测"的语义探测，
+//   充电节点却是硬编码，两条路径的健壮性完全不对等。
+//
+// 设计原则（与温度节点对齐）：
+//   1) 已知路径只作为 **优先候选**，不是唯一答案。存在且可读就直接用，命中即止。
+//   2) 候选没命中时，在受限目录树里枚举节点，按"语义关键词 + 值合法性"打分挑选。
+//   3) 只搜白名单目录（/sys/class/{power_supply,xm_power,thermal}），
+//      绝不递归全盘 —— sysfs 里递归会碰到设备树、procfs 等海量节点。
+//   4) 得分相同则保留第一顺位，保证同一台机器行为可复现。
+
+// 通用排除词：这些都不是我们要的控制节点，混进来会造成误写
+static const char *CN_AVOID_COMMON[] = {
+    "uevent", "modalias", "subsystem", "driver_override", "of_node",
+    "/power/", "consumers", "suppliers",
+    nullptr
+};
+
+static std::vector<std::string> g_cn_scan_cache;   // 枚举结果缓存
+static std::string              g_cn_scan_root;    // 缓存对应的根，换了要重扫
+
+// 在受限目录里枚举「最多两级子目录下」的所有普通文件（限制深度，不递归全盘）
+static void cn_collect(const std::string &base, int depth,
+                       std::vector<std::string> &out) {
+    if (depth < 0 || out.size() > 4000) return;
+    DIR *d = opendir(base.c_str());
+    if (!d) return;
+    struct dirent *e;
+    std::vector<std::string> subdirs;
+    while ((e = readdir(d))) {
+        if (e->d_name[0] == '.') continue;
+        std::string p = base + "/" + e->d_name;
+        struct stat st;
+        if (stat(p.c_str(), &st) != 0) continue;
+        if (S_ISDIR(st.st_mode)) {
+            if (depth > 0) subdirs.push_back(p);
+        } else {
+            out.push_back(p);       // 只收普通文件
+        }
+    }
+    closedir(d);
+    for (size_t i = 0; i < subdirs.size(); i++)
+        cn_collect(subdirs[i], depth - 1, out);
+}
+
+// 刷新枚举缓存（每次 scan 调一次，之后复用）
+static void cn_refresh_cache() {
+    if (!g_cn_scan_cache.empty() && g_cn_scan_root == g_root) return;
+    g_cn_scan_cache.clear();
+    g_cn_scan_root = g_root;
+
+    // 只扫这三个根：power_supply（电池/USB）、xm_power（小米私有）、thermal
+    const char *roots[] = {
+        "/sys/class/power_supply",
+        "/sys/class/xm_power",
+        "/sys/class/thermal",
+        nullptr
+    };
+    for (int i = 0; roots[i]; i++) {
+        std::string base = g_root + roots[i];
+        cn_collect(base, 2, g_cn_scan_cache);
+    }
+    // 去重（不同 class 可能有软链接指向同一设备，路径不同但都是候选）
+    std::sort(g_cn_scan_cache.begin(), g_cn_scan_cache.end());
+    g_cn_scan_cache.erase(std::unique(g_cn_scan_cache.begin(), g_cn_scan_cache.end()),
+                          g_cn_scan_cache.end());
+}
+
+static bool cn_avoided(const std::string &path, const char *const *avoid) {
+    for (int i = 0; avoid && avoid[i]; i++)
+        if (path.find(avoid[i]) != std::string::npos) return true;
+    return false;
+}
+
+// 探测单个节点：返回最终路径（空字符串 = 没找到）
+// out_known_hit: true = 命中的是已知路径（高置信），false = 探测命中
+static std::string cn_resolve(const CNodeSpec &spec, const std::string &known) {
+    // ① 环境变量显式覆盖：优先级最高，用户说了算
+    const char *env = getenv(spec.env_key);
+    if (env && *env) {
+        if (node_readable(env)) {
+            logf("[node] %s：使用环境变量 %s=%s", spec.desc, spec.env_key, env);
+            return std::string(env);
+        }
+        logf("[node] %s：环境变量 %s=%s 不可读，退回自动探测",
+             spec.desc, spec.env_key, env);
+    }
+
+    // ② 已知完整路径：存在就直接用（等价于 exact 候选）
+    if (node_readable(known)) return known;
+    logf("[node] %s：已知路径 %s 不存在，进入语义探测", spec.desc, known.c_str());
+
+    // ③ 语义探测：枚举 + 打分
+    cn_refresh_cache();
+
+    std::string best;
+    int best_score = -1;
+    const char *best_lv = "";
+    for (size_t i = 0; i < g_cn_scan_cache.size(); i++) {
+        const std::string &p = g_cn_scan_cache[i];
+        size_t slash = p.rfind('/');
+        if (slash == std::string::npos) continue;
+        std::string fn = p.substr(slash + 1);
+
+        if (cn_avoided(p, CN_AVOID_COMMON)) continue;
+
+        // ---------- 名称匹配分层（L1~L5）----------
+        // L1 完全相同 +100  —— 原行为，保证已在支持列表的机型零变化
+        // L2 别名精确 +85   —— 不同 OS/厂商的等价命名
+        // L3 前缀     +75   —— 模糊层里最强：chg_curr_limit 明确是在讲 chg_curr
+        // L4 包含     +65   —— my_chg_curr_xyz 也算，但边上可能挂了别的语义
+        // L5 后缀     +55   —— xxx_chg_curr 最弱，前缀部分可能是别的东西
+        //
+        // ⚠ 分数必须 前缀 > 包含 > 后缀。
+        //   早先写成 前缀(55) < 包含(70) 是错的：文件名以关键词开头时它必然
+        //   也"包含"关键词，若包含得分更高，就会出现
+        //   chg_curr_limit(前缀,55) 输给 my_chg_curr_xyz(包含,70) —— 排序反了。
+        int score = -1;
+        const char *lv = "";
+
+        if (fn == spec.name) {
+            score = 100; lv = "精确";
+        } else {
+            for (int k = 0; spec.alias && spec.alias[k]; k++) {
+                if (fn == spec.alias[k]) { score = 85; lv = "别名"; break; }
+            }
+            if (score < 0 && spec.kw && *spec.kw) {
+                std::string kw = spec.kw;
+                if (fn.find(kw) != std::string::npos) {
+                    if (fn.compare(0, kw.size(), kw) == 0) {
+                        score = 75; lv = "前缀";
+                    } else if (fn.size() >= kw.size() &&
+                               fn.compare(fn.size() - kw.size(), kw.size(), kw) == 0) {
+                        score = 55; lv = "后缀";
+                    } else {
+                        score = 65; lv = "包含";
+                    }
+                }
+            }
+        }
+        if (score < 0) continue;    // 名称层完全没命中
+
+        // ---------- 目录亲和度 ----------
+        bool hint_ok = (spec.hint && *spec.hint &&
+                        p.find(spec.hint) != std::string::npos);
+
+        // 安全阀：模糊匹配（L3~L5）必须有目录做二次确认。
+        // 判据分两级（原来只认写死的 hint 太严，OS 改目录名就全军覆没）：
+        //   A. 命中 hint（如 /charger_thermal）—— 最强
+        //   B. 落在充电/电源语义目录体系内（xm_power / power_supply / charger） —— 次强
+        // 只有 A、B 都不满足才淘汰。这样既能挡住无关子系统里的同名文件，
+        // 又不会因为 OS 改了目录名就把整片功能判死。
+        // 兜底原则不变：宁可不控，也不写错节点（写错过充的代价太大）。
+        bool fuzzy = (strcmp(lv, "精确") != 0 && strcmp(lv, "别名") != 0);
+        bool in_chg_tree = (p.find("/xm_power")     != std::string::npos ||
+                            p.find("/power_supply") != std::string::npos ||
+                            p.find("/charger")      != std::string::npos);
+        if (fuzzy && !hint_ok && !in_chg_tree) continue;
+        if (hint_ok) {
+            score += 60;
+        } else if (p.find("/xm_power")     != std::string::npos ||
+                   p.find("/power_supply") != std::string::npos ||
+                   p.find("/charger")      != std::string::npos) {
+            score += 20;
+        } else {
+            score -= 30;
+        }
+
+        // 值合法性：能读出整数说明是真实控制节点，不是占位文件
+        int probe = 0;
+        if (read_int(p.c_str(), &probe)) score += 5;
+        // 可写性：控制节点通常要能写
+        if (node_writable(p)) score += 10;
+
+        if (score > best_score) {
+            best_score = score;
+            best = p;
+            best_lv = lv;
+        }
+    }
+
+    if (!best.empty()) {
+        logf("[node] %s：语义探测命中 %s（%s匹配，得分 %d，枚举 %d 个）",
+             spec.desc, best.c_str(), best_lv, best_score,
+             (int)g_cn_scan_cache.size());
+        return best;
+    }
+
+    logf("[node] %s：语义探测未命中（枚举 %d 个文件，目标名 %s）",
+         spec.desc, (int)g_cn_scan_cache.size(), spec.name);
+    return std::string();
+}
+
 struct Profile {
     int  ver;
     int  os_major;              // 澎湃 OS 主版本（3/4/0=未知），扫描时记录
@@ -1080,6 +1417,22 @@ static int do_scan(bool verbose) {
             logf("[scan]   仅有兜底节点 zone%ld (%s)，该节点被 fake_temp 改写，"
                  "伪装后恒为设定值，不可用于温度墙判断", fbz, fbt.c_str());
     }
+    // 充电节点语义探测结果：未命中的节点必须显式报出来，
+    // 否则用户只会看到"功能失效"却完全不知道是哪个节点找不到（原硬编码版本的老毛病）。
+    if (!g_cn_miss.empty()) {
+        logf("[scan] 注意：%d 个充电节点未命中已知路径与语义探测：", (int)g_cn_miss.size());
+        for (size_t i = 0; i < g_cn_miss.size(); i++)
+            logf("[scan]   %s（将使用回退路径，对应功能自动禁用）", g_cn_miss[i].c_str());
+    }
+    logf("[scan] 实际使用节点：");
+    logf("[scan]   fake_temp         = %s", N_FAKE_TEMP);
+    logf("[scan]   wired_ctrl_limit  = %s", N_CTRL_LIMIT);
+    logf("[scan]   fake_pps_ptf      = %s", N_PPS_PTF);
+    logf("[scan]   battery/temp      = %s", N_BATT_TEMP);
+    logf("[scan]   usb/online        = %s", N_USB_ONLINE);
+    logf("[scan]   battery/status    = %s", N_BATT_STAT);
+    logf("[scan]   wired_chg_curr    = %s", N_WIRED_CURR);
+    logf("[scan]   wired_thermal_rm  = %s", N_THERMAL_RM);
     logf("[scan] 充电控制点：curr=%s ctrl=%s pps=%s fake=%s",
          g_prof.cur_ok ? "可写" : "缺失",
          g_prof.ctrl_ok ? "可写" : "缺失",

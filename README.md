@@ -52,6 +52,76 @@ KernelSU / Magisk 模块。通过 bind mount 伪装系统温度节点，解除�
 
 亮度只在你主动操作时改变，守护进程不参与，避免与手动调节冲突。
 
+## 充电节点语义探测
+
+v1.4.0 起，8 个充电/状态节点不再依赖写死的绝对路径，改为**三级解析 + 语义打分**，已有路径只作为参考候选。
+换 ROM、换机型、厂商改名、目录结构调整时自动迁移，不需要改代码。
+
+### 解析顺序（命中即止）
+
+| 级 | 来源 | 说明 |
+|---|---|---|
+| L0 | 环境变量 `TCB_*` | 手动指定优先（调试/特殊机型） |
+| L1 | 已知完整路径 | 原硬编码路径，**只作为参考候选**，不存在则自动降级 |
+| L2 | 语义探测 | 枚举 `/sys/class/{power_supply,xm_power,thermal}` 两级深度，打分选最优 |
+
+### 打分规则
+
+匹配层级（五档，严格降序，不会出现排序反转）：
+
+| 层级 | 条件 | 基础分 |
+|---|---|---|
+| 精确 | 文件名 == 目标名 | +100 |
+| 别名 | 命中别名表（不同 OS/厂商等价命名） | +85 |
+| 前缀 | 以关键词开头 | +75 |
+| 包含 | 含关键词 | +65 |
+| 后缀 | 以关键词结尾 | +55 |
+
+目录亲和（叠加）：
+
+| 条件 | 分值 |
+|---|---|
+| 命中该节点声明的 `hint` 目录 | +60 |
+| 落在 `/xm_power`、`/power_supply`、`/charger` 体系内 | +20 |
+| 两者都不满足 | −30 |
+
+其它修正：值可读 +5、可写 +10。
+
+### 安全阀
+
+模糊匹配（别名/前缀/包含/后缀）必须满足「命中 hint」或「在充电体系内」之一，否则直接淘汰。
+实测可挡住 `sys/class/misc/randomdir`、`sys/block/sda` 这类无关目录，不会把充电值写到无关节点上。
+
+`battery/temp`、`usb/online`、`battery/status` 三个 AOSP 标准属性名**不启用模糊匹配**，只认精确名（`temp` 太泛，模糊会误伤）。
+
+### 别名表
+
+| 目标节点 | 接受的等价命名 |
+|---|---|
+| `wired_chg_curr` | wired_chg_curr / wired_charge_current / chg_curr_limit / charging_current_limit / fast_chg_current / batt_chg_curr |
+| `wired_thermal_remove` | wired_thermal_remove / thermal_remove / wired_temp_limit_remove / chg_thermal_remove |
+| `wired_ctrl_limit` | wired_ctrl_limit / wired_ctrl / chg_ctrl_limit / charger_ctrl_limit |
+| `fake_pps_ptf` | fake_pps_ptf / pps_ptf / fake_pps_passthrough / pps_passthrough |
+| `fake_temp` | fake_temp / fake_temperature / emul_temp / sim_temp / simulate_temp |
+
+### 诊断
+
+`scan` 会把每个节点的解析结果写进日志（`run.log`），格式为：
+
+```
+[node] 充电电流上限：已知路径 /sys/.../wired_chg_curr 不存在，进入语义探测
+[node] 充电电流上限：语义探测命中 /sys/.../chgx/wired_chg_curr（精确匹配，得分 135，枚举 14 个）
+[node] 伪温度注入点：语义探测未命中（枚举 9 个文件，目标名 fake_temp）
+```
+
+命中会给出匹配层级、得分、枚举文件数；未命中会给出枚举数量与目标名，便于判断是「环境没有」还是「名字不认识」。
+
+### 开销
+
+- 探测只在 `scan` / `apply` / daemon 启动时执行一次，结果缓存在进程内，运行期零开销
+- 枚举上限 4000 个文件，单次 `scan` 实测 0.6 秒内完成
+- 全路径命中时（已支持机型）零探测、零额外枚举，行为与 v1.3.3 完全一致
+
 ## 结构
 
 ```
@@ -105,7 +175,9 @@ temp_charge_boost log [行数]           # 日志尾部
 
 - 需要 KernelSU 或 Magisk
 - 需要 Android 内核支持 bind mount 与 `/sys/class/thermal` 框架
-- 充电提速与温度墙依赖小米 `xm_power` 节点，缺失时自动跳过，不影响温度伪装
+- 充电提速与温度墙不再绑定 `xm_power` 固定路径：优先用已知路径，不存在则语义探测
+  `/sys/class/{power_supply,xm_power,thermal}` 下语义等价的节点（支持别名与模糊匹配）
+- 完全找不到任何可用的充电节点时，该功能自动停用，不影响温度伪装
 - 屏幕亮度依赖 `/sys/class/backlight`，缺失时自动隐藏该功能
 
 主要测试机型：红米 K100 Pro Max（M098FE / songyuan / 内核 6.12.69 / HyperOS 3）
@@ -147,6 +219,37 @@ temp_charge_boost log [行数]           # 日志尾部
 > 第 3 步是关键：若卸载时温度墙正在限流，不恢复电流会让充电永久卡在最低 3A，用户很难自查。
 
 ## 版本历史
+### v1.4.0 (2026-11-04)
+充电节点从**硬编码**改为**语义探测**。原有 8 个节点的绝对路径降级为「参考候选」，
+路径不存在时自动在 `/sys/class/{power_supply,xm_power,thermal}` 内按语义打分寻找等价节点。
+换 ROM / 换机型 / 厂商改名不再需要改代码。
+
+- ✨ **三级解析**：环境变量 `TCB_*` → 已知完整路径（参考候选）→ 语义探测
+- ✨ **五档匹配打分**：精确 +100 / 别名 +85 / 前缀 +75 / 包含 +65 / 后缀 +55，严格降序
+- ✨ **目录亲和**：命中 `hint` 目录 +60 / 充电体系内 +20 / 都不中 −30
+- ✨ **别名表**：覆盖 5 个节点的常见等价命名（`chg_curr_limit`、`thermal_remove`、`wired_ctrl`、`pps_ptf`、`emul_temp` 等）
+- ✨ **安全阀**：模糊匹配必须命中 `hint` 或在 `/xm_power`、`/power_supply`、`/charger` 体系内，否则淘汰；
+  实测可挡住 `sys/class/misc/*`、`sys/block/*` 等无关目录
+- 🔧 **`battery/temp`、`usb/online`、`battery/status` 不启用模糊匹配**：AOSP 标准属性名只认精确名（`temp` 太泛会误伤）
+- 🔧 **修正排序反转缺陷**：首版前缀分（55）低于包含分（70），会导致 `chg_curr_limit` 输给 `my_chg_curr_xyz`；
+  已改为前缀 75 > 包含 65 > 后缀 55
+- 🔧 **枚举上限 4000 文件**，单次 `scan` 实测 0.6 秒内完成；探测结果进程内缓存，运行期零开销
+- 🔧 **诊断增强**：`scan` 日志给出每个节点的匹配层级、得分、枚举文件数；未命中给出枚举数量与目标名
+
+**离线 mock 回归（7 个场景全过）**
+
+| 场景 | 验证点 | 结果 |
+|---|---|---|
+| T1 | 五级共存排序（精确 > 别名 > 前缀 > 包含 > 后缀） | ✅ 别名 160 胜出 |
+| T2 | 纯模糊层（前缀 150 > 包含 140 > 后缀） | ✅ |
+| T3 | `uevent` / `modalias` / `of_node` 排除词过滤 | ✅ 正确跳过 |
+| T4 | 只读节点降分 | ✅（proot root 特性，非缺陷） |
+| T5 | 改名后 `apply` 写入落到探测节点 | ✅ 4/4 节点写入正确 |
+| T6 | 原状路径 0 探测（回归） | ✅ 行为与 v1.3.3 一致 |
+| T7 | 目录全删不崩溃 | ✅ rc=0，逐节点报告未命中 |
+
+> 已在支持机型（K100 Pro Max / OS4）上，所有已知路径命中时**探测次数为 0**，零额外枚举，与 v1.3.3 行为完全一致。
+
 ### v1.3.3 (2026-10-30)
 
 OS4（OS4.0.5.0.XGNCNXM / Android 17）充电限流适配。**全部基于真机实测，含 mock 回归**。
