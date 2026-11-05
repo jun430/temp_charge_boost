@@ -44,6 +44,7 @@
 
 static std::string g_root;          // 根前缀，空串表示真实路径
 static std::string g_work;
+static std::string g_mlist;   // <WORK>/mounted.list：已成功挂载的挂载点清单
 static std::string g_fake;
 static std::string g_real;
 static std::string g_log;
@@ -159,6 +160,7 @@ static void init_paths() {
     g_fake = g_work + "/fake";
     g_real = g_work + "/real";
     g_log  = g_work + "/run.log";
+    g_mlist = g_work + "/mounted.list";
 
     g_zone_root  = env_or("TCB_ZONE_ROOT",  R + "/sys/devices/virtual/thermal");
     g_zone_class = env_or("TCB_ZONE_CLASS", R + "/sys/class/thermal");
@@ -239,6 +241,7 @@ static void init_paths() {
 #define FAKE_DIR     (g_fake.c_str())
 #define REAL_DIR     (g_real.c_str())
 #define LOG_FILE     (g_log.c_str())
+#define MOUNT_LIST   (g_mlist.c_str())
 #define ZONE_ROOT    (g_zone_root.c_str())
 #define ZONE_CLASS   (g_zone_class.c_str())
 #define N_FAKE_TEMP  (g_n_fake_temp.c_str())
@@ -318,6 +321,111 @@ static bool write_int(const char *path, int v) {
     return w == n;
 }
 
+// 前置声明：unmount_all 定义在下方，sweep_fake_mounts 需要先用
+static int unmount_all(const char *target);
+
+// 判断某个 mountinfo 路径字段是否指向本模块的 fake 目录。
+//
+// 为什么需要双匹配（实测证据）：
+//   真实设备：bind mount 的 root 就是源路径，形如
+//     /data/adb/temp_charge_boost/fake/thermal_zone12/temp  → 前缀命中
+//   proot 容器：root 恒为 "/"，source 却是宿主绝对路径，形如
+//     /data/data/.../proot-distro/installed-rootfs/ubuntu/tmp/SW/w/fake/thermal_zone12/temp
+//     FAKE_DIR = /tmp/SW/w/fake → 前缀不等，只能靠后缀命中。
+//
+// 后缀匹配要求 FAKE_DIR 出现位置的前一字符是 '/'（或就在串首），
+// 且其后一字符是 '/' 或串尾，因此 <WORK>/fakeXXX 这类相似项不会被误判。
+static bool is_our_fake_path(const char *path) {
+    if (!path || !*path) return false;
+    const size_t pre = strlen(FAKE_DIR);
+    if (pre == 0) return false;
+
+    // 前缀匹配：path == FAKE_DIR 或 path 以 "FAKE_DIR/" 开头
+    if (strncmp(path, FAKE_DIR, pre) == 0 &&
+        (path[pre] == '/' || path[pre] == 0))
+        return true;
+
+    // 后缀匹配：在 path 里找 FAKE_DIR，要求边界干净
+    const char *hit = strstr(path, FAKE_DIR);
+    while (hit) {
+        bool front_ok = (hit == path) || (hit[-1] == '/');
+        bool back_ok  = (hit[pre] == '/' || hit[pre] == 0);
+        if (front_ok && back_ok) return true;
+        hit = strstr(hit + 1, FAKE_DIR);
+    }
+    return false;
+}
+
+
+// 兜底扫描：把「属于本模块伪装」的挂载全部剥掉，不依赖 ZONE_ROOT。
+//
+// v1.4.4 新增。为什么不能只靠 restore_temp() 的 readdir：
+//   那条路径依赖 ZONE_ROOT 当前有效。实测把热区目录改名后，
+//   opendir 成功但 readdir 零命中，函数静默返回 0，
+//   95 个伪装挂载一条都没卸，只剩日志刷 "Directory not empty"。
+//   真实场景：ROM 升级改了热区路径、分区重挂、目录被删后重建。
+//
+// 判据（双路，缺一不可，原因见下）：
+//   A. mountinfo 字段 4（root）以 FAKE_DIR 开头
+//      真实 Linux 上 bind mount 的 root 字段就是源路径。
+//   B. '-' 分隔符后的 source 字段（f[sep+2]）以 FAKE_DIR 开头
+//      proot 环境实测：bind mount 的 root 恒为 '/'，源路径只出现在 source 字段。
+//      实测样本：1000000 1 0:1 / /tmp/mm/b/temp rw - bind /data/.../tmp/mm/a/temp rw
+//   只写 A 会导致 proot/容器环境下 sweep 永远返回 0（v1.4.4 首版踩过）；
+//   只写 B 在极老内核上 source 字段可能是 "-" 之外的怪值，故两路都判。
+//
+// 前缀比较后额外要求下一字符是 '/' 或结束，防 <WORK>/fakeXXX 误伤。
+// 返回实际剥掉的挂载条数；-1 表示 mountinfo 打不开。
+static int sweep_fake_mounts() {
+    FILE *fp = fopen("/proc/self/mountinfo", "r");
+    if (!fp) return -1;
+
+    char line[4096];
+    std::vector<std::string> victims;
+
+    while (fgets(line, sizeof(line), fp)) {
+        char *f[80];
+        int nf = 0;
+        char *p = line;
+        while (*p && nf < 80) {
+            while (*p == ' ') p++;
+            if (!*p || *p == '\n') break;
+            f[nf++] = p;
+            while (*p && *p != ' ' && *p != '\n') p++;
+            if (*p) *p++ = 0;
+        }
+        if (nf < 6) continue;
+
+        const char *mnt = f[4];   // 字段 5：挂载点
+        bool hit = false;
+
+        // 判据 A：root 字段（真实设备上就是 bind 源路径）
+        if (is_our_fake_path(f[3])) hit = true;
+
+        // 判据 B：'-' 之后的 source 字段（proot 下源路径只在这里）
+        if (!hit) {
+            for (int i = 4; i < nf; i++) {
+                if (f[i][0] == '-' && f[i][1] == 0) {
+                    if (i + 2 < nf && is_our_fake_path(f[i + 2])) hit = true;
+                    break;
+                }
+            }
+        }
+        if (!hit) continue;
+
+        victims.push_back(std::string(mnt));
+    }
+    fclose(fp);
+
+    // 先收集完再卸，避免边遍历 mountinfo 边改挂载表
+    int n = 0;
+    for (size_t i = 0; i < victims.size(); i++) {
+        int r = unmount_all(victims[i].c_str());
+        if (r > 0) n += r;
+    }
+    return n;
+}
+
 // 统计某挂载点当前叠了几层（读 /proc/self/mountinfo 第 5 字段）
 // 关键：sysfs 上对同一目标重复 bind mount 会导致层数翻倍（1→2→4→8），
 // 必须精确知道层数，剥到 0 才能再挂，否则会指数膨胀。
@@ -377,6 +485,25 @@ static int unmount_all(const char *target) {
         n++;
     }
     return n;
+}
+
+// 按清单卸单个挂载点（restore 的第 2 层兜底专用）。
+//
+// 与 unmount_all 的区别：不把 count_layers 当成循环前提。
+// proot 实测：umount() 返回 0，但本 namespace 的 mountinfo 里该记录不会立刻消失，
+// 用 count_layers 判循环会一路 n++ 到 4096（日志出现 restored=4096）。
+// 这里改成「umount 成功即认为卸掉」，只有失败时才用 count_layers 判断是否真没挂载。
+// 最多重试 8 次，彻底失败返回 -1（由调用方记日志，不静默吞）。
+static int unmount_listed(const char *target) {
+    if (!target || !*target) return 0;
+    for (int i = 0; i < 8; i++) {
+        if (umount(target) == 0) return 1;
+        // 普通 umount 失败：可能有多层残留绑定，试惰性分离
+        if (umount2(target, MNT_DETACH) == 0) return 1;
+        // 两次都失败，才回头看看到底还有没有挂载
+        if (count_layers(target) == 0) return i > 0 ? 1 : 0;
+    }
+    return -1;
 }
 
 // 写日志（带时间戳，超过 64KB 自动截断）
@@ -1488,6 +1615,9 @@ static int apply_temp(int want) {
     }
     ensure_dir(WORK_DIR);
     ensure_dir(FAKE_DIR);
+    // v1.4.4：本次 apply 会重建清单，先清空上一轮记录，
+    // 避免 restore 拿着过期挂载点去卸（卸载已不存在的挂载点是空操作，但会污染日志）。
+    unlink(MOUNT_LIST);
     ensure_dir(REAL_DIR);
 
     // 没有任何 profile 时先扫一遍：这就是「安装后首次启动自动适配」的落点。
@@ -1565,6 +1695,17 @@ static int apply_temp(int want) {
         }
         if (mount(fake.c_str(), tgt.c_str(), nullptr, MS_BIND, nullptr) == 0) {
             ok++;
+            // v1.4.4：把成功挂载的挂载点写进清单。
+            // restore 靠它做确定性卸载，不需要重新枚举热区、也不需要解析 mountinfo，
+            // 是「ZONE_ROOT 改名 / 热区目录被删 / proot 路径映射」三种场景的统一兜底。
+            {
+                int mf = open(MOUNT_LIST, O_WRONLY | O_CREAT | O_APPEND | O_CLOEXEC, 0644);
+                if (mf >= 0) {
+                    std::string rec = tgt + "\n";
+                    ssize_t wr = write(mf, rec.data(), rec.size()); (void)wr;
+                    close(mf);
+                }
+            }
         } else {
             // 不能静默失败：挂不上就等于该节点没伪装，必须能在日志里看到原因
             logf("[apply] 挂载失败 zone%s (%s): %s",
@@ -1618,6 +1759,44 @@ static int restore_temp() {
         closedir(d);
     }
     // 恢复官方伪装接口
+    // v1.4.4 第 2 层兜底：按 apply 时记下的挂载点清单逐条卸。
+    // 这是确定性最强的一层：不枚举热区、不解析 mountinfo，
+    // 只要文件在就能精确卸掉当初挂上去的每一个挂载点。
+    {
+        FILE *ml = fopen(MOUNT_LIST, "r");
+        if (ml) {
+            char ml_line[1024];
+            int cnt = 0;
+            while (fgets(ml_line, sizeof(ml_line), ml)) {
+                char *q = ml_line;
+                while (*q == ' ' || *q == '\t') q++;
+                size_t ln = strlen(q);
+                while (ln > 0 && (q[ln-1] == '\n' || q[ln-1] == '\r' || q[ln-1] == ' ')) q[--ln] = 0;
+                if (ln == 0) continue;
+                int r = unmount_listed(q);
+                if (r > 0) cnt += r;
+                else if (r < 0) logf("恢复温度伪装：清单项卸载失败 %s", q);
+            }
+            fclose(ml);
+            if (cnt > 0) {
+                logf("恢复温度伪装：按挂载清单额外卸载 %d 条", cnt);
+                n += cnt;
+            }
+            unlink(MOUNT_LIST);
+        }
+    }
+
+    // v1.4.4 兜底：按 mountinfo 源路径再刮一遍，不依赖 ZONE_ROOT 是否还存在。
+    // 上面的 readdir 在 ZONE_ROOT 失效时会零命中且静默返回，
+    // 只靠它会把所有伪装挂载留给系统（实测 87 条全残留）。
+    {
+        int swept = sweep_fake_mounts();
+        if (swept > 0) {
+            logf("恢复温度伪装：兜底扫描额外卸载 %d 条挂载", swept);
+            n += swept;
+        }
+    }
+
     write_int(N_FAKE_TEMP, -999);
 
     // 恢复充电相关节点。

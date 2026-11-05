@@ -183,15 +183,28 @@ done
 # 这一步不依赖热区枚举是否成功 —— 即便 ROM 换了目录结构、或者模块曾把
 # 假值挂到了别的文件上，只要还挂着就一定在这里出现。
 if [ -d "$FAKE_DIR" ] || [ -n "$TCB_WORK" ]; then
-    awk -v src="$FAKE_DIR/" '$0 ~ / - / {
-        for (i = 1; i <= NF; i++) {
-            if ($i == "-") { mnt = $(i+2); break }
+    # 兜底：扫 mountinfo 把属于本模块伪装的挂载全部卸掉，不依赖热区目录是否存在。
+    #
+    # 判据（双路）：
+    #   A. 字段 4（root）以 $FAKE_DIR 开头 —— 真实 Linux 上 bind mount 的 root 就是源路径
+    #   B. "-" 之后的 source 字段以 $FAKE_DIR 开头 —— proot/容器下 root 恒为 '/'，只能靠这里
+    # 实测样本（proot）：1000000 1 0:1 / /tmp/mm/b/temp rw - bind /data/.../tmp/mm/a/temp rw
+    # 只写 A 会让兜底永远空转（v1.4.3 的 index(root,src)==1 就是这个 bug，从未生效过）。
+    awk -v src="$FAKE_DIR" '
+        {
+            sep = 0
+            for (i = 1; i <= NF; i++) if ($i == "-") { sep = i; break }
+            if (sep == 0) next
+            mnt = $5
+            hit = 0
+            if (index($4, src) == 1 && ($4 == src || substr($4, length(src) + 1, 1) == "/")) hit = 1
+            if (!hit && (sep + 2) <= NF) {
+                s = $(sep + 2)
+                if (index(s, src) == 1 && (s == src || substr(s, length(src) + 1, 1) == "/")) hit = 1
+            }
+            if (hit) print mnt
         }
-        for (i = 1; i <= NF; i++) {
-            if ($i ~ /^\.*\// || $i ~ /^\//) { root = $i; break }
-        }
-        if (index(root, src) == 1) print mnt
-    }' /proc/self/mountinfo 2>/dev/null | sort -u | while read -r m; do
+    ' /proc/self/mountinfo 2>/dev/null | sort -u | while read -r m; do
         [ -n "$m" ] || continue
         log "兜底卸载残留挂载: $m"
         strip_zone "$m"
