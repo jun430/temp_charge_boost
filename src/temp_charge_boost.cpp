@@ -1471,7 +1471,21 @@ static int do_scan(bool verbose) {
     return total;
 }
 
+// 伪装温度的合法区间（单位 0.001℃，即 -40℃ ~ 120℃）。
+// 为什么必须校验：thermal_zone*/temp 是系统温控的输入，写入越界值会直接
+// 误导热管理 —— 写 9999(99.99℃) 会让系统误以为过热而激进降频，
+// 写极小值则等于解除应有的过热保护。非法值一律拒绝，不做任何写入。
+#define TEMP_MIN (-40000)
+#define TEMP_MAX (120000)
+
 static int apply_temp(int want) {
+    if (want < TEMP_MIN || want > TEMP_MAX) {
+        logf("[apply] 拒绝非法温度 %d（合法区间 %d~%d，单位 0.001℃）",
+             want, TEMP_MIN, TEMP_MAX);
+        fprintf(stderr, "[temp] invalid temp %d (allowed %d..%d)\n",
+                want, TEMP_MIN, TEMP_MAX);
+        return -1;
+    }
     ensure_dir(WORK_DIR);
     ensure_dir(FAKE_DIR);
     ensure_dir(REAL_DIR);
@@ -2806,10 +2820,17 @@ int main(int argc, char **argv) {
     init_paths();                    // 必须在任何路径访问之前
     const char *cmd = argc > 1 ? argv[1] : "status";
 
-    if (!strcmp(cmd, "daemon"))       run_daemon();
-    else if (!strcmp(cmd, "scan"))    do_scan(argc > 2 && !strcmp(argv[2], "-v"));
-    else if (!strcmp(cmd, "apply"))   apply_temp(argc > 2 ? atoi(argv[2]) : DEF_TEMP);
-    else if (!strcmp(cmd, "restore")) restore_temp();
+    // 退出码必须向上传递：customize.sh / service.sh 等脚本靠它判断成败。
+    // 实测踩过：scan 在无 thermal 时内部返回 -1，但这里丢弃了返回值，
+    // 脚本看到 rc=0 就继续往下跑，把失败当成功。
+    if (!strcmp(cmd, "daemon"))       run_daemon();   // void，内部常驻
+    else if (!strcmp(cmd, "scan"))    return do_scan(argc > 2 && !strcmp(argv[2], "-v")) > 0 ? 0 : 1;
+    else if (!strcmp(cmd, "apply")) {
+        // apply_temp 返回成功挂载的节点数：>0 成功，==0 一个都没挂上（失败），<0 参数非法
+        int n = apply_temp(argc > 2 ? atoi(argv[2]) : DEF_TEMP);
+        return n > 0 ? 0 : 1;
+    }
+    else if (!strcmp(cmd, "restore")) { restore_temp(); return 0; }
     else if (!strcmp(cmd, "status"))  show_status();
     else if (!strcmp(cmd, "dump"))    dump_json();
     else if (!strcmp(cmd, "profile")) {
