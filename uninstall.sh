@@ -258,10 +258,25 @@ log_fb "卸载日志保留于 $ULOG"
 # ============================================================
 # 7. 标记 module.prop（管理器最后一次可见状态要干净）
 # ============================================================
+# 只在"已安装位置"改，绝不碰源码树。
+# 事故背景（v1.4.4）：mock 测试时 MODDIR 被指到仓库目录，
+# 这个 sed 把仓库的 module.prop 改成了「已卸载」并随发布包发出去，
+# 用户装完后管理器显示成已卸载态。
+# 护栏：MODDIR 必须是 /data/adb/modules/* 或含 module.prop 的已部署目录，
+#       且必须有 bin/ 子目录（源码树根目录没有 bin/temp_charge_boost 以外的特征，
+#       但源码树根有 src/ 与 mocktest/，用它们做反向排除）。
 MP="$MODDIR/module.prop"
 if [ -f "$MP" ]; then
-    if ! grep -q "已卸载" "$MP" 2>/dev/null; then
+    _safe=1
+    case "$MODDIR" in
+        */mocktest*|*/src/*|*/src) _safe=0 ;;
+    esac
+    # 源码树根含 src/ 与 mocktest/ 目录，已部署目录不含
+    [ -d "$MODDIR/src" ] && [ -d "$MODDIR/mocktest" ] && _safe=0
+    if [ "$_safe" = "1" ] && ! grep -q "已卸载" "$MP" 2>/dev/null; then
         sed -i 's|^description=.*|description=已卸载。温度伪装与充电控制均已还原。|' "$MP" 2>/dev/null
+    elif [ "$_safe" = "0" ]; then
+        log "跳过 module.prop 标记：MODDIR 疑似源码树（$MODDIR）"
     fi
 fi
 

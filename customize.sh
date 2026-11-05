@@ -142,8 +142,8 @@ ui_print " "
 ui_print "━━━━━━━━━━━━━━━━━━━"
 ui_print " 选择安装模式"
 ui_print "━━━━━━━━━━━━━━━━━━━"
-opt "标准安装（温度墙 51℃ 开启）" "轻量安装（只伪装温度，温度墙关闭）" "15 秒后默认标准安装"
-MODE_KEY=$(wait_for_volume_key 15)
+opt "标准安装（温度墙 51℃ 开启）" "轻量安装（只伪装温度，温度墙关闭）" "8 秒后默认标准安装（无需按键）"
+MODE_KEY=$(wait_for_volume_key 8)
 case "$MODE_KEY" in
     1) INSTALL_MODE="full";   ui_print "  → 标准安装"; log_ok "用户选择: 标准安装" ;;
     2) INSTALL_MODE="light";  ui_print "  → 轻量安装（温度墙默认关闭）"; log_ok "用户选择: 轻量安装" ;;
@@ -157,8 +157,8 @@ ui_print " "
 ui_print "━━━━━━━━━━━━━━━━━━━"
 ui_print " 确认安装？"
 ui_print "━━━━━━━━━━━━━━━━━━━"
-opt "确认安装" "取消安装" "15 秒后自动确认"
-CONFIRM_KEY=$(wait_for_volume_key 15)
+opt "确认安装" "取消安装" "8 秒后自动确认（无需按键）"
+CONFIRM_KEY=$(wait_for_volume_key 8)
 case "$CONFIRM_KEY" in
     2)
         ui_print "  → 已取消，未做任何改动"
@@ -179,6 +179,16 @@ ui_print "- 正在部署文件..."
 # 权限：脚本 0755，配置 0644
 set_perm_recursive "$MODPATH" 0 0 0755 0644
 set_perm "$BIN" 0 0 0755
+
+# 清理上一次卸载/禁用残留的标记文件。
+# 不清理的后果：service.sh 读到 remove/disable 就直接 exit 0，
+# 表现为"装上了但完全没生效"（Magisk 在线安装、部分管理器保留旧文件时会出现）。
+for _mk in remove disable skip_mount; do
+    if [ -e "$MODPATH/$_mk" ]; then
+        rm -f "$MODPATH/$_mk" 2>/dev/null
+        log_warn "已清理残留标记: $_mk"
+    fi
+done
 
 # ============================================================
 # 生成默认配置

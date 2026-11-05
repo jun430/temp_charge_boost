@@ -1,6 +1,6 @@
 id=temp_charge_boost
 name=温度伪装 · 充电提速
-version=v1.4.4
-versionCode=144
+version=v1.4.5
+versionCode=145
 author=雨色
-description=已卸载。温度伪装与充电控制均已还原。
+description=澎湃 OS 温度伪装与充电提速。post-fs-data 一次性 bind mount，运行期零开销；逐 zone 语义探测，危险/射频类自动保留真实值。支持 WebUI 查看温度、调节阈值与日志，安装与卸载均有完整还原。

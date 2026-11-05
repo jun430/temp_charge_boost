@@ -1731,6 +1731,22 @@ static int apply_temp(int want) {
     // 挂载完成后写入真实值快照（供 WebUI 跨进程读取）
     flush_real_values();
 
+    // 写入 target.conf：记录本次设定的目标伪装温度（0.1℃）。
+    // 为什么必须写：target.conf 原来只有 customize.sh 安装时写一次，
+    // 用户手动 `tcb apply 360` 后 WebUI 仍显示旧的 350（或文件被删后显示 0）。
+    // WebUI 的「伪装温度」卡片读的就是这个文件，不写就会显示错误值。
+    {
+        char tp[256];
+        snprintf(tp, sizeof(tp), "%s/target.conf", WORK_DIR);
+        int tf = open(tp, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
+        if (tf >= 0) {
+            char tb[16];
+            int tn = snprintf(tb, sizeof(tb), "%d\n", want);
+            ssize_t tw = write(tf, tb, tn); (void)tw;
+            close(tf);
+        }
+    }
+
     fprintf(stderr, "[temp] mounted=%d skipped=%d failed=%d\n", ok, skip, fail);
     logf("应用温度伪装: 挂载 %d 个, 跳过 %d 个, 失败 %d 个, 目标 %d",
          ok, skip, fail, want);
@@ -2517,6 +2533,52 @@ static int read_real(const char *zone) {
     return v;
 }
 
+// 前置声明：read_best 定义在下方，real_or_zone 需要先用（v1.4.5）
+static int read_best(long z);
+
+// zone 编号 → REAL_DIR 下的文件名。
+// apply 写快照用 e->d_name（thermal_zone<N>），flush_real_values 也用同样格式，
+// 所以 read_real 的入参必须是 "thermal_zone<N>"。
+static std::string zone_name_of(long z) {
+    char b[40];
+    snprintf(b, sizeof(b), "thermal_zone%ld", z);
+    return std::string(b);
+}
+
+// 取某个 zone 的真实温度：优先 REAL_DIR 快照，退回直接读节点。
+//
+// 为什么必须优先快照（v1.4.5）：
+//   bind mount 之后 thermal_zone*/temp 全部指向 fake 值，直接读只会拿到假值，
+//   WebUI 的「温度对比（真实/伪装）」因此全显示 `--` 或 0。
+//   REAL_DIR 里的值是挂载前写入、daemon 用持久 fd 持续刷新的真值，不受挂载影响。
+//
+// 返回值单位与 read_best 一致（0.001℃）；全取不到返回 0。
+static int real_or_zone(long z, const char *zone_name) {
+    if (zone_name && *zone_name) {
+        int v = read_real(zone_name);
+        if (v > 0) return v;
+    }
+    if (z >= 0) {
+        int v = read_best(z);
+        if (v > 0) return v;
+    }
+    return 0;
+}
+
+// 读目标伪装温度（0.1℃，如 350 = 35.0℃）。
+// 来源：<WORK>/target.conf（apply 与安装时写入）。
+// 绝不读 strategy_fg/fake_temp —— 那个节点已被伪装覆盖，读到的是假值本身。
+static int read_target_temp(std::string *src) {
+    char p[256];
+    snprintf(p, sizeof(p), "%s/target.conf", WORK_DIR);
+    int v = 0;
+    if (read_int(p, &v) && v > 0) {
+        if (src) *src = "target.conf";
+        return v;
+    }
+    return 0;
+}
+
 // ============ 持久 fd 读取真实温度（绕过 bind mount）============
 // 原理：mount --bind 只改变路径解析，已打开的 fd 仍指向原始 inode，
 // 所以挂载前先 open 保存 fd，之后 pread 每次都能拿到实时真实值。
@@ -2827,8 +2889,9 @@ static void dump_json() {
             long z = zone_by_type("batt_therm");
             if (z < 0 && load_profile() && g_prof.batt_trusted)
                 z = g_prof.batt_zone;
-            int v = (z >= 0) ? read_best(z) : 0;
-            if (v > 0) real_bt = v / 10;   // 0.001℃ -> 0.01℃，与 cp_master 同刻度
+            std::string zn = (z >= 0) ? zone_name_of(z) : std::string();
+            int v = real_or_zone(z, zn.c_str());
+            if (v > 0) real_bt = v / 10;   // 0.001℃ -> 0.01℃   // 0.001℃ -> 0.01℃，与 cp_master 同刻度
         }
     }
 
@@ -2836,20 +2899,34 @@ static void dump_json() {
     // CPU：按 cpu-<cluster>-<core> 聚合为每核最高温，输出 8 个核
     int cpu_vals[32];
     int cpu_cnt = cpu_core_temps(cpu_vals, 32);
+    // v1.4.5：cpu_core_temps 内部走 read_best，会被挂载污染；
+    // 这里对有 REAL_DIR 快照的 cpu zone 逐个覆盖成真值。
+    {
+        static long zl[64];
+        int zn2 = zones_by_prefix("cpu-0-", zl, 64);
+        int zn3 = zones_by_prefix("cpu-1-", zl + zn2, 64 - zn2);
+        int ztot = zn2 + zn3;
+        for (int i = 0; i < ztot && i < cpu_cnt; i++) {
+            std::string nm = zone_name_of(zl[i]);
+            int rv = read_real(nm.c_str());
+            if (rv > 0) cpu_vals[i] = rv;
+        }
+    }
     // GPU：gpuss-* 取最高温（用户要求只显示一个 GPU 温度）
     int gpu_real = 0;
     {
         long tmp[32];
         int m = zones_by_prefix("gpuss-", tmp, 32);
         for (int i = 0; i < m; i++) {
-            int v = read_best(tmp[i]);
+            std::string zn = zone_name_of(tmp[i]);
+            int v = real_or_zone(tmp[i], zn.c_str());
             if (v > gpu_real) gpu_real = v;
         }
     }
     int cpu_therm_real = 0;
     {
         long z = zone_by_type("cpu_therm");
-        if (z >= 0) cpu_therm_real = read_best(z);
+        if (z >= 0) { std::string n = zone_name_of(z); cpu_therm_real = real_or_zone(z, n.c_str()); }
     }
     int gpu_kgsl = 0;
     read_int("/sys/class/kgsl/kgsl-3d0/temp", &gpu_kgsl);
@@ -2858,11 +2935,11 @@ static void dump_json() {
     int batt_real = 0, chg_real = 0, conn_real = 0;
     {
         long z = zone_by_type("batt_therm");
-        if (z >= 0) batt_real = read_best(z);
+        if (z >= 0) { std::string n = zone_name_of(z); batt_real = real_or_zone(z, n.c_str()); }
         z = zone_by_type("charger_therm");
-        if (z >= 0) chg_real = read_best(z);
+        if (z >= 0) { std::string n = zone_name_of(z); chg_real = real_or_zone(z, n.c_str()); }
         z = zone_by_type("conn_therm");
-        if (z >= 0) conn_real = read_best(z);
+        if (z >= 0) { std::string n = zone_name_of(z); conn_real = real_or_zone(z, n.c_str()); }
     }
     // 电池组：batt_therm 是独立 NTC（真实）；battery/batt_temp 会被 fake_temp 改写。
     // 因此 batt_real 取 batt_therm，batt_drv 只作参考。
@@ -2870,9 +2947,9 @@ static void dump_json() {
     read_int(N_BATT_TEMP, &batt_ps);
     {
         long z = zone_by_type("batt_therm");
-        if (z >= 0) batt_ntc = read_best(z);
+        if (z >= 0) { std::string n = zone_name_of(z); batt_ntc = real_or_zone(z, n.c_str()); }
         z = zone_by_type("batt_temp");
-        if (z >= 0) batt_drv = read_best(z);
+        if (z >= 0) { std::string n = zone_name_of(z); batt_drv = real_or_zone(z, n.c_str()); }
     }
 
     // 充电功率
@@ -2918,12 +2995,22 @@ static void dump_json() {
         }
     }
 
+    // 目标伪装温度（从 target.conf 读，不受挂载影响）
+    std::string tgt_src;
+    int tgt_v = read_target_temp(&tgt_src);
+
     printf("{");
     printf("\"mounted\":%d,", cnt);
     // 真实挂载总层数（正常应等于 mounted；若远大于则说明发生叠层）
     // 复用上面已算好的结果，不再重复扫 mountinfo
     printf("\"layers\":%d,", layers_total);
+    // fake_temp = 节点当前实际值（伪装后即伪装值），用于对照"伪装是否真写进去了"。
+    // 用户想看的"目标伪装温度"是 target_temp，两者语义不同，不要混用。
     printf("\"fake_temp\":%d,", ft);
+    // fake_temp = 节点当前实际值（伪装后即伪装值）；
+    // target_temp = 用户设定的目标值。两者语义不同，WebUI 的「伪装温度」用后者。
+    printf("\"target_temp\":%d,", tgt_v);
+    printf("\"target_src\":\"%s\",", tgt_src.c_str());
     printf("\"batt_temp\":%d,", bt);
     printf("\"real_batt_temp\":%d,", real_bt);
     printf("\"ctrl_limit\":%d,", cl);

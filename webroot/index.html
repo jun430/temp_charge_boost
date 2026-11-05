@@ -918,7 +918,13 @@ async function refresh(){
       mEl.textContent = d.mounted;
       mEl.className = 'v accent';
     }
-    document.getElementById('fakeTemp').innerHTML = (d.fake_temp/10).toFixed(1) + '<small>℃</small>';
+    // 「伪装温度」显示目标值 target_temp（用户设定的温度）。
+    // 不能用 fake_temp —— 那读的是 strategy_fg/fake_temp 节点，已被 bind mount 覆盖，
+    // 读回来的是"伪装后的值"而非目标值（实测某些 ROM 上读回 0，卡片显示 0.0℃）。
+    // target_temp 来自 target.conf，不受挂载影响，始终是用户设定的真实目标。
+    const tgt = (typeof d.target_temp === 'number' && d.target_temp > 0)
+      ? d.target_temp : (d.fake_temp || 0);
+    document.getElementById('fakeTemp').innerHTML = (tgt/10).toFixed(1) + '<small>℃</small>';
     const cl = document.getElementById('ctrlLimit');
     cl.textContent = d.ctrl_limit;
     cl.className = 'v ' + (d.ctrl_limit === 0 ? 'green' : d.ctrl_limit >= 14 ? 'red' : 'orange');
@@ -932,7 +938,8 @@ async function refresh(){
 
     // 温度对比（单位 0.001℃，除以 1000）
     const f = (v) => v > 0 ? (v/1000).toFixed(1) + '℃' : '--';
-    const fk = (d.fake_val/10).toFixed(1) + '℃';
+    // 伪装列同样用 target_temp（目标值），不用 fake_val（被污染的节点值）
+    const fk = (tgt/10).toFixed(1) + '℃';
     document.getElementById('cpuReal').textContent  = d.cpu_max > 0 ? (d.cpu_max/1000).toFixed(1) + '℃' : '--';
     document.getElementById('cpuFake').textContent  = fk;
     document.getElementById('gpuReal').textContent  = f(d.gpu_real);
