@@ -630,7 +630,181 @@ static void ensure_dir(const char *p) {
 struct ZoneCache { std::string type; long zone; };
 static std::vector<ZoneCache> g_zone_cache;
 
+// ============ 语义匹配（v1.4.6，方案 B）============
+//
+// 背景：第三方 ROM / 其他机型会把 thermal zone 改成同义不同名的形式
+//   batt_therm   -> battery_therm / xiaomi_batt_therm / bms_temp
+//   charger_therm-> chg_therm / charger_temp
+//   conn_therm   -> usb_therm / connector_therm
+// 原来的 zone_by_type() 用 t == type 精确比较，改名后返回 -1，
+// dump 里 batt_real/chg_real/conn_real 全部读不到 -> WebUI 显示 "--"。
+// 而伪装本身是成功的（zone_wanted 不看具体名字），
+// 于是形成「伪装生效但读不到真实值」的错配。
+//
+// 语义匹配用打分法，三道闸门保证不误伤：
+//   ① excluded_type() 排除表先行（射频/基带/跳闸类永不参与）
+//   ② 必须共享语义词根（batt/chg/conn/cpu/gpu/therm/temp/charger/usb）
+//   ③ 分数低于门槛直接放弃（宁可返回 -1，也不拿错节点冒充）
+
+// 语义词根表：查询串与候选 type 必须至少共享一个
+static const char *SEM_ROOTS[] = {
+    "batt", "chg", "charger", "conn", "usb",
+    "cpu", "gpu", "therm", "temp", nullptr
+};
+
+// 语义匹配的最低分数：低于此值视为"不相关"，返回 -1
+#define SEM_MIN_SCORE 50
+
+// ============ 词干归一化（v1.4.6 方案 B 补丁 v2）============
+//
+// 为什么必须有这一步（实测证据，dbg_sem.sh）：
+//   mock 里 thermal_zone10 的 type = "battery_therm"，
+//   zone_by_type("batt_therm") 匹配失败，而 zone_by_type("battery") 能命中。
+//   因为纯字符串匹配下 "batt_therm" 与 "battery_therm"：
+//     - 不相等；不以对方为前缀（第 5 字符是 'e' 不是 '_'）；互不为子串
+//   => 得分 0，被门槛挡掉。
+//
+//   batt / battery 是同一个词的不同写法，这属于纯字符串匹配的固有局限。
+//   正确做法是归一化到统一词干后再比对，而不是放宽分数门槛
+//   （放宽门槛会让 foo_sensor 之类的无关名字也能命中，风险不可接受）。
+//
+// 映射规则保守：只映射 thermal 语义里明确等价的缩写/全称。
+// 长词优先替换（charger 必须在 chg 之前处理，避免只替换一半）。
+struct SemStem { const char *from; const char *to; };
+static const SemStem SEM_STEMS[] = {
+    // 电池：battery / bat / batt 全部归一为 batt
+    { "battery",     "batt" },
+    { "bat",         "batt" },
+    // 充电：charger / charge / chg 归一为 chg
+    { "charger",     "chg"  },
+    { "charge",      "chg"  },
+    // 接口：connector / connect / conn 归一为 conn
+    { "connector",   "conn" },
+    { "connect",     "conn" },
+    // 温度：thermal -> therm；temperature -> temp
+    { "thermal",     "therm" },
+    { "temperature", "temp"  },
+    // 其余本身就是词干
+    { nullptr, nullptr }
+};
+
+// 把 type 串按分隔符切成词，逐词归一化后用 '_' 重新拼接。
+// 这样 "battery_therm" -> "batt_therm"，与查询串 "batt_therm" 完全相等。
+static std::string sem_stem(const std::string &in) {
+    std::string out;
+    size_t i = 0;
+    while (i < in.size()) {
+        // 找到下一个词（分隔符：_ - . 或串尾）
+        size_t j = i;
+        while (j < in.size() && in[j] != '_' && in[j] != '-' && in[j] != '.') j++;
+        std::string tok = in.substr(i, j - i);
+
+        // 逐条映射（长词在前，避免 "charger" 只替换掉 "charge" 留下 "r"）
+        for (int k = 0; SEM_STEMS[k].from; k++) {
+            if (tok == SEM_STEMS[k].from) { tok = SEM_STEMS[k].to; break; }
+        }
+        if (!out.empty()) out += '_';
+        out += tok;
+
+        i = (j < in.size()) ? j + 1 : j;
+    }
+    return out;
+}
+
+// 判断两个字符串是否共享语义词根
+static bool sem_share_root(const std::string &a, const std::string &b) {
+    for (int i = 0; SEM_ROOTS[i]; i++) {
+        const char *r = SEM_ROOTS[i];
+        if (a.find(r) != std::string::npos && b.find(r) != std::string::npos)
+            return true;
+    }
+    return false;
+}
+
+// 语义打分：0 表示完全不匹配
+//   100  精确相等
+//   80   前缀相等（候选以查询串开头，如 batt_therm -> batt_therm_xiaomi）
+//   75   后缀相等（查询串以候选开头，如 batt_therm_xiaomi <- batt_therm）
+//   60   双向子串（如 battery_therm 含 batt 段）
+static int sem_score(const std::string &want0, const std::string &cand0) {
+    // v1.4.6 补丁 v2：先归一化到统一词干再比对，
+    // 解决 batt_therm vs battery_therm 这类同义不同写法
+    const std::string want = sem_stem(want0);
+    const std::string cand = sem_stem(cand0);
+
+    if (cand == want) return 100;
+
+    // 前缀：候选比查询长，且以查询开头
+    if (cand.size() > want.size() && cand.compare(0, want.size(), want) == 0) {
+        // 边界必须是分隔符，避免 batt_therm 命中 batt_thermistor_xyz 这类
+        char c = cand[want.size()];
+        if (c == '_' || c == '-' || c == '.') return 80;
+    }
+    // 反向：查询比候选长，且以候选开头（候选是查询的前缀）
+    if (want.size() > cand.size() && want.compare(0, cand.size(), cand) == 0) {
+        char c = want[cand.size()];
+        if (c == '_' || c == '-' || c == '.') return 75;
+    }
+    // 子串双向
+    if (cand.find(want) != std::string::npos) return 60;
+    if (want.find(cand) != std::string::npos) return 60;
+
+    return 0;
+}
+
+// 语义查找：遍历所有 zone，返回得分最高且通过全部闸门的 zone 编号。
+// 同分时取编号最小的，保证结果稳定可复现（zone 编号开机后固定）。
+static long zone_find_semantic(const char *type) {
+    // 排障开关：TCB_NO_SEMANTIC=1 可完全关闭模糊匹配
+    const char *off = getenv("TCB_NO_SEMANTIC");
+    if (off && off[0] == '1') return -1;
+
+    std::string want(type);
+    DIR *d = opendir(ZONE_ROOT);
+    if (!d) return -1;
+
+    struct dirent *e;
+    long   best_zone  = -1;
+    int    best_score = 0;
+    std::string best_type;
+    while ((e = readdir(d))) {
+        if (strncmp(e->d_name, "thermal_zone", 12) != 0) continue;
+        std::string tp = std::string(ZONE_ROOT) + "/" + e->d_name + "/type";
+        std::string t;
+        if (!read_str(tp.c_str(), t)) continue;
+
+        // 闸门①：排除表（射频/基带/跳闸类永不参与模糊匹配）
+        if (excluded_type(t)) continue;
+        // 闸门②：必须共享语义词根（用归一化后的串判断，
+        // 保证 battery_therm 与 batt_therm 视为同词根）
+        if (!sem_share_root(sem_stem(want), sem_stem(t))) continue;
+
+        int sc = sem_score(want, t);
+        if (sc < SEM_MIN_SCORE) continue;      // 闸门③：分数门槛
+
+        long zn = atol(e->d_name + 12);
+        // 分数更高，或同分但编号更小（取稳定结果）
+        if (sc > best_score || (sc == best_score && best_zone >= 0 && zn < best_zone)) {
+            best_score = sc;
+            best_zone  = zn;
+            best_type  = t;
+        }
+    }
+    closedir(d);
+
+    if (best_zone >= 0) {
+        logf("[semantic] %s -> zone%ld (%s) 得分 %d（精确匹配失败，走语义回退）",
+             type, best_zone, best_type.c_str(), best_score);
+    }
+    return best_zone;
+}
+
 // 精确匹配 type，返回 zone 编号；找不到返回 -1
+//
+// v1.4.6：精确匹配失败后自动回退到语义匹配（方案 B）。
+//   命中结果同样写入 g_zone_cache，因此热路径（温度墙每秒轮询）仍是零扫描。
+//   语义匹配结果单独缓存（键加 "~~sem~~" 可见前缀与精确缓存区分），
+//   避免精确名与语义名互相污染（例如真有 batt_therm 时，不该复用 battery_therm 的缓存）。
 static long zone_by_type(const char *type) {
     // 先查缓存
     for (auto &c : g_zone_cache)
@@ -650,8 +824,26 @@ static long zone_by_type(const char *type) {
     closedir(d);
     // 命中则缓存；未命中不缓存（可能该节点确实不存在，避免反复扫描也避免存 -1 后
     // 设备补上节点时永久失效——实际场景中 zone 不会热插拔，这里取保守策略）
-    if (found >= 0) g_zone_cache.push_back({ type, found });
-    return found;
+    if (found >= 0) {
+        g_zone_cache.push_back({ type, found });
+        return found;
+    }
+
+    // === v1.4.6 方案 B：精确匹配失败 -> 语义回退 ===
+    // 缓存键加 "~~sem~~" 前缀，与精确命中分开存，
+    // 防止真有 batt_therm 时复用了 battery_therm 的语义缓存。
+    {
+        std::string sk = std::string("~~sem~~") + type;
+        for (auto &c : g_zone_cache)
+            if (c.type == sk) return c.zone;
+
+        long sz = zone_find_semantic(type);
+        if (sz >= 0) {
+            g_zone_cache.push_back({ sk, sz });
+            return sz;
+        }
+    }
+    return -1;
 }
 
 // 按 type 前缀收集 zone 编号，返回数量
