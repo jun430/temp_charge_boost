@@ -308,6 +308,59 @@ static bool read_str(const char *path, std::string &out) {
     return true;
 }
 
+// ============ 统一 zone 枚举层：前向声明（v1.4.7）============
+// 定义在下方「统一 zone 枚举层」区块，但 zones_by_prefix 等函数在前面就用到，
+// 所以必须在这里先声明。
+static bool is_zone_dir(const char *name);
+static bool zone_type_of(const char *name, std::string &type);
+static long zone_num_of(const char *name);
+
+// v1.4.7f：enum_zones 回调没有返回值也无法提前退出，
+// 用文件级静态变量承接「按 type 精确查找」与「cpu-N-M 聚合」的结果。
+struct ZbCtx { const char *want; long got; };
+static ZbCtx g_zb;
+struct CcCtx { long *zs; int *keys; int *zn; };
+static CcCtx g_cc;
+
+// ============ zone 编号 ↔ 真实目录名 双向注册表（v1.4.7e）============
+//
+// 为什么必须有这张表：
+//   zone_num_of 对非标准目录名（xiaomi_batt / oem_gpu / vendor_cpucluster0…）
+//   返回 FNV 哈希值（≥100000），而整条链路原来一律用 thermal_zone%ld 拼路径，
+//   拼出来的路径在 sysfs 里根本不存在 → 枚举到了也读不到、挂不上。
+//   注册表把「编号」与「真实目录名」绑定，所有拼路径的地方都改走 zone_path_of。
+#include <map>
+static std::map<long, std::string> g_zn_map;      // 编号 -> 目录名
+static std::map<std::string, long> g_zn_rev;      // 目录名 -> 编号
+static void zn_register(const char *name) {
+    if (!name || !*name) return;
+    long z = zone_num_of(name);
+    g_zn_map[z] = name;
+    g_zn_rev[name] = z;
+}
+// 编号 → 真实目录名（未注册时退回标准名，保持旧行为）
+static std::string zone_dir_name(long z) {
+    auto it = g_zn_map.find(z);
+    if (it != g_zn_map.end() && !it->second.empty()) return it->second;
+    char b[40];
+    snprintf(b, sizeof(b), "thermal_zone%ld", z);
+    return std::string(b);
+}
+// 编号 → ZONE_ROOT 下的完整路径
+static std::string zone_path_of(long z) {
+    return ZONE_ROOT + std::string("/") + zone_dir_name(z);
+}
+// 编号 → REAL_DIR 下的完整路径（快照文件）
+static std::string zone_real_path_of(long z) {
+    return std::string(REAL_DIR) + "/" + zone_dir_name(z);
+}
+// 编号 → FAKE_DIR 下的完整路径（伪装源文件）
+static std::string zone_fake_path_of(long z) {
+    return std::string(FAKE_DIR) + "/" + zone_dir_name(z);
+}
+static int  zones_by_root(const char *root, const char *const *excl,
+                          long *out, int maxn);
+
 static bool write_int(const char *path, int v) {
     // 真实 sysfs 会整体替换内容，但普通文件（离线模拟测试、某些 vendor 节点）
     // 不截断会导致新值拼接旧值（实测 350 写进 "3509" 变 "3509"）。
@@ -620,6 +673,68 @@ static void ensure_dir(const char *p) {
     }
 }
 
+
+// ============ 统一 zone 枚举层：定义（v1.4.7）============
+//
+// 唯一枚举入口。任何需要遍历 thermal zone 的地方都必须走这里，
+// 保证「扫描到的」「伪装的」「读取的」永远是同一批节点。
+
+// 单个 zone 的结构识别：能读到合法 type 就算 zone
+static bool zone_type_of(const char *name, std::string &type) {
+    if (!name || !*name) return false;
+    std::string tp = std::string(ZONE_ROOT) + "/" + name + "/type";
+    if (!read_str(tp.c_str(), type)) return false;
+    if (type.empty() || type.size() > 64) return false;
+    return true;
+}
+
+// 目录名 -> 稳定 zone 编号
+//   标准名 "thermal_zone123" -> 123（与旧行为完全一致）
+//   非标准名 -> FNV-1a 哈希（>= 100000，避开标准编号段）
+static long zone_num_of(const char *name) {
+    const char *p = strstr(name, "thermal_zone");
+    if (p) return atol(p + 12);
+    if (strncmp(name, "zone", 4) == 0 && isdigit((unsigned char)name[4]))
+        return atol(name + 4);
+    unsigned int h = 2166136261u;
+    for (const unsigned char *q = (const unsigned char*)name; *q; q++) {
+        h ^= *q;
+        h *= 16777619u;
+    }
+    return 100000L + (long)(h & 0xFFFFFF);
+}
+
+// 目录名是否像一个 thermal zone
+//   a) 以 "thermal_zone" 开头   —— 标准 AOSP 命名
+//   b) 能读到合法 type          —— 结构识别（兼容任何改名）
+static bool is_zone_dir(const char *name) {
+    if (!name || !*name) return false;
+    if (name[0] == '.') return false;
+    if (strncmp(name, "thermal_zone", 12) == 0) return true;
+    std::string t;
+    if (zone_type_of(name, t)) return true;
+    return false;
+}
+
+// 统一枚举：遍历 ZONE_ROOT 下所有 zone，回调 (编号, 目录名, type)
+static int enum_zones(void (*cb)(long zone, const char *name,
+                                 const std::string &type, void *ud), void *ud) {
+    DIR *d = opendir(ZONE_ROOT);
+    if (!d) return 0;
+    struct dirent *e;
+    int n = 0;
+    while ((e = readdir(d))) {
+        if (!is_zone_dir(e->d_name)) continue;
+        std::string t;
+        if (!zone_type_of(e->d_name, t)) continue;
+        zn_register(e->d_name);       // v1.4.7f：统一入口在此绑定编号↔目录名
+        if (cb) cb(zone_num_of(e->d_name), e->d_name, t, ud);
+        n++;
+    }
+    closedir(d);
+    return n;
+}
+
 // ============ 按 type 名查找 zone（替代硬编码编号）============
 // 硬编码 zone 编号在不同固件/内核版本下会错位，按 type 名查找才可靠。
 //
@@ -749,6 +864,34 @@ static int sem_score(const std::string &want0, const std::string &cand0) {
     if (cand.find(want) != std::string::npos) return 60;
     if (want.find(cand) != std::string::npos) return 60;
 
+    // v1.4.7h：词根共享兜底。
+    // 原四档（相等/前缀/反向前缀/子串）漏掉两类真实命名：
+    //   usb_conn   vs conn_therm  —— 共享词根 conn，但词序不同，无前后缀关系
+    //   cpullc-0-0 vs cpu_therm   —— cpu 被压进 cpullc 这个单词里
+    // 二者在真机上都属「语义一样、写法不同」，必须能匹配到。
+    {
+        // ⚠ 只统计「区分性词根」。therm/temp 几乎出现在每个 thermal zone 里，
+        //   若计入会变成「全都共享」→ 语义匹配退化成随机命中。
+        //   实测踩过：查询 conn_therm 时，battery_therm 因共享 therm 也拿了 55 分，
+        //   与 usb_conn 同分后靠扫描顺序决出，结果取到电池温度。
+        static const char *DISTINCT[] = {
+            "batt", "chg", "charger", "conn", "usb", "cpu", "gpu", nullptr
+        };
+        int shared = 0;
+        for (int i = 0; DISTINCT[i]; i++) {
+            const char *r = DISTINCT[i];
+            if (want.find(r) != std::string::npos && cand.find(r) != std::string::npos)
+                shared++;
+        }
+        if (shared > 0) {
+            // 55 = 刚好越过 SEM_MIN_SCORE(50)，排在所有强匹配之后
+            // 共享多个词根时略微加权，但不超过子串档（60）
+            int base = 55 + (shared > 1 ? 3 : 0);
+            if (base > 59) base = 59;
+            return base;
+        }
+    }
+
     return 0;
 }
 
@@ -759,44 +902,46 @@ static long zone_find_semantic(const char *type) {
     const char *off = getenv("TCB_NO_SEMANTIC");
     if (off && off[0] == '1') return -1;
 
-    std::string want(type);
-    DIR *d = opendir(ZONE_ROOT);
-    if (!d) return -1;
+    // v1.4.7g：改用 enum_zones（唯一枚举入口）。
+    // 原实现用 strncmp("thermal_zone",12) + atol(+12) 硬门槛，
+    // 是「扫描层用语义、读取层用硬编码」的最后遗留：
+    // 改名目录（xiaomi_batt / vendor_zoneA / oem_gpu）根本不进语义匹配，
+    // 导致 zone_by_type 精确失败后语义回退也拿不到 → batt_ntc/conn_real 恒 0。
+    struct SemCtx {
+        const char *want;
+        long best_zone;
+        int  best_score;
+        std::string best_type;
+    };
+    static SemCtx sc;
+    sc.want = type;
+    sc.best_zone = -1;
+    sc.best_score = 0;
+    sc.best_type.clear();
 
-    struct dirent *e;
-    long   best_zone  = -1;
-    int    best_score = 0;
-    std::string best_type;
-    while ((e = readdir(d))) {
-        if (strncmp(e->d_name, "thermal_zone", 12) != 0) continue;
-        std::string tp = std::string(ZONE_ROOT) + "/" + e->d_name + "/type";
-        std::string t;
-        if (!read_str(tp.c_str(), t)) continue;
-
+    enum_zones([](long zone, const char *name, const std::string &t, void *ud) {
+        (void)name; (void)ud;
         // 闸门①：排除表（射频/基带/跳闸类永不参与模糊匹配）
-        if (excluded_type(t)) continue;
-        // 闸门②：必须共享语义词根（用归一化后的串判断，
+        if (excluded_type(t)) return;
+        // 闸门②：必须共享语义词根（归一化后判断，
         // 保证 battery_therm 与 batt_therm 视为同词根）
-        if (!sem_share_root(sem_stem(want), sem_stem(t))) continue;
-
-        int sc = sem_score(want, t);
-        if (sc < SEM_MIN_SCORE) continue;      // 闸门③：分数门槛
-
-        long zn = atol(e->d_name + 12);
+        if (!sem_share_root(sem_stem(sc.want), sem_stem(t))) return;
+        int sco = sem_score(sc.want, t);
+        if (sco < SEM_MIN_SCORE) return;      // 闸门③：分数门槛
         // 分数更高，或同分但编号更小（取稳定结果）
-        if (sc > best_score || (sc == best_score && best_zone >= 0 && zn < best_zone)) {
-            best_score = sc;
-            best_zone  = zn;
-            best_type  = t;
+        if (sco > sc.best_score ||
+            (sco == sc.best_score && sc.best_zone >= 0 && zone < sc.best_zone)) {
+            sc.best_score = sco;
+            sc.best_zone  = zone;
+            sc.best_type  = t;
         }
-    }
-    closedir(d);
+    }, nullptr);
 
-    if (best_zone >= 0) {
-        logf("[semantic] %s -> zone%ld (%s) 得分 %d（精确匹配失败，走语义回退）",
-             type, best_zone, best_type.c_str(), best_score);
+    if (sc.best_zone >= 0) {
+        logf("[semantic] %s -> %s (%s) 得分 %d（精确匹配失败，走语义回退）",
+             type, zone_dir_name(sc.best_zone).c_str(), sc.best_type.c_str(), sc.best_score);
     }
-    return best_zone;
+    return sc.best_zone;
 }
 
 // 精确匹配 type，返回 zone 编号；找不到返回 -1
@@ -810,18 +955,15 @@ static long zone_by_type(const char *type) {
     for (auto &c : g_zone_cache)
         if (c.type == type) return c.zone;
 
-    DIR *d = opendir(ZONE_ROOT);
-    if (!d) return -1;
-    struct dirent *e;
+    // v1.4.7f：走统一枚举层，兼容任何改名目录（原 strncmp+atol 硬门槛已废）
     long found = -1;
-    while ((e = readdir(d))) {
-        if (strncmp(e->d_name, "thermal_zone", 12) != 0) continue;
-        std::string tp = std::string(ZONE_ROOT) + "/" + e->d_name + "/type";
-        std::string t;
-        if (!read_str(tp.c_str(), t)) continue;
-        if (t == type) { found = atol(e->d_name + 12); break; }
-    }
-    closedir(d);
+    g_zb.want = type; g_zb.got = -1;
+    enum_zones([](long zone, const char *name, const std::string &tp, void *ud) {
+        (void)name; (void)ud;
+        if (g_zb.got >= 0) return;                 // 已命中，忽略后续
+        if (tp == g_zb.want) g_zb.got = zone;
+    }, nullptr);
+    found = g_zb.got;
     // 命中则缓存；未命中不缓存（可能该节点确实不存在，避免反复扫描也避免存 -1 后
     // 设备补上节点时永久失效——实际场景中 zone 不会热插拔，这里取保守策略）
     if (found >= 0) {
@@ -847,23 +989,76 @@ static long zone_by_type(const char *type) {
 }
 
 // 按 type 前缀收集 zone 编号，返回数量
+// 按词根收集 zone（v1.4.7k：取代原严格前缀 + strncmp 硬门槛）
+//
+// 原实现两个问题，都会让「改名 / 压缩命名」的 zone 读不到：
+//   1) strncmp(e->d_name,"thermal_zone",12) 硬门槛 → 改名目录直接跳过
+//   2) t.compare(0, pl, prefix) 严格前缀 → "cpullc-0-0" 匹配不上 "cpu"
+//      （cpullc 是 CPU LLC 温度，高通平台真实存在的命名）
+//
+// 现在：走 enum_zones 统一枚举 + sem_stem 归一化后做「包含」判断。
+// 代价是可能多收几个节点，但 cpu_core_temps 只取前 maxn 个按编号升序，
+// 且 trip 类已被 excluded_type 排除，不会把阈值当温度。
 static int zones_by_prefix(const char *prefix, long *out, int maxn) {
+    if (!prefix || !*prefix) return 0;
+    struct PfxCtx { const char *pfx; long *out; int *n; int maxn; };
+    static PfxCtx pc;
+    int n = 0;
+    pc.pfx = prefix; pc.out = out; pc.n = &n; pc.maxn = maxn;
+    enum_zones([](long zone, const char *name, const std::string &t, void *ud) {
+        (void)name; (void)ud;
+        if (*(pc.n) >= pc.maxn) return;
+        if (excluded_type(t)) return;             // 闸门：排除射频/跳闸类
+        std::string ts = sem_stem(t);
+        if (ts.find(pc.pfx) == std::string::npos) return;
+        pc.out[*(pc.n)] = zone;
+        (*(pc.n))++;
+    }, nullptr);
+    return n;
+}
+
+// ============ 词根级查找（v1.4.7）============
+//
+// 比 zones_by_prefix 更宽松：不看前缀是否相同，只看「归一化后是否包含词根」。
+// 用途：CPU / GPU 的节点在不同机型上命名差异很大
+//   cpu: cpu-0-0-0 / cpu0-therm / cpullc-0-0 / soc-therm
+//   gpu: gpuss-0 / gpu-0-0 / gpu_therm / kgsl
+// 硬编码前缀必然漏，必须按词根匹配。
+//
+// 仍然过两道闸门：
+//   ① is_zone_dir()      —— 统一枚举层（结构识别）
+//   ② excluded_type()    —— 射频/基带/跳闸排除
+//   ③ 额外排除词（如 cpu 类的 trip）
+static int zones_by_root(const char *root, const char *const *excl,
+                         long *out, int maxn) {
+    if (!root || !*root) return 0;
+    std::string r = root;
     DIR *d = opendir(ZONE_ROOT);
     if (!d) return 0;
     struct dirent *e;
     int n = 0;
-    size_t pl = strlen(prefix);
     while ((e = readdir(d)) && n < maxn) {
-        if (strncmp(e->d_name, "thermal_zone", 12) != 0) continue;
-        std::string tp = std::string(ZONE_ROOT) + "/" + e->d_name + "/type";
+        if (!is_zone_dir(e->d_name)) continue;
         std::string t;
-        if (!read_str(tp.c_str(), t)) continue;
-        if (t.size() >= pl && t.compare(0, pl, prefix) == 0)
-            out[n++] = atol(e->d_name + 12);
+        if (!zone_type_of(e->d_name, t)) continue;
+        if (excluded_type(t)) continue;          // 闸门②
+        std::string ts = sem_stem(t);
+        if (ts.find(r) == std::string::npos) continue;   // 词根命中
+        bool bad = false;
+        if (excl) for (int i = 0; excl[i]; i++)
+            if (ts.find(excl[i]) != std::string::npos) { bad = true; break; }
+        if (bad) continue;                       // 闸门③
+        zn_register(e->d_name);                  // 绑定编号↔目录名
+        zn_register(e->d_name);
+        out[n++] = zone_num_of(e->d_name);
     }
     closedir(d);
     return n;
 }
+
+// CPU / GPU 的排除词表
+static const char *CPU_EXCL[] = { "trip", "hw_trip", "hw-trip", nullptr };
+static const char *GPU_EXCL[] = { "trip", nullptr };
 
 
 // ============ 安装时节点自动扫描与适配 ============
@@ -1089,7 +1284,7 @@ static int zone_follows_fake_temp(long zn) {
     }
 
     char zp[256];
-    snprintf(zp, sizeof(zp), "%s/thermal_zone%ld/temp", ZONE_ROOT, zn);
+    snprintf(zp, sizeof(zp), "%s/temp", zone_path_of(zn).c_str());
 
     int t0 = 0;
     if (!read_int(zp, &t0)) {
@@ -1243,11 +1438,17 @@ static void cn_refresh_cache() {
     g_cn_scan_cache.clear();
     g_cn_scan_root = g_root;
 
-    // 只扫这三个根：power_supply（电池/USB）、xm_power（小米私有）、thermal
+    // 枚举根（v1.4.7j 加入 kgsl）：
+    //   power_supply  电池 / USB / 各类 charger
+    //   xm_power      小米私有充电控制点
+    //   thermal       thermal zone（注意：与 zone 层是两套语义，此处只用于
+    //                 充电控制节点的兜底探测，读值仍由 zone 层负责）
+    //   kgsl          GPU（gpu_kgsl 字段的唯一来源；不加进来就永远解析不到）
     const char *roots[] = {
         "/sys/class/power_supply",
         "/sys/class/xm_power",
         "/sys/class/thermal",
+        "/sys/class/kgsl",
         nullptr
     };
     for (int i = 0; roots[i]; i++) {
@@ -1643,7 +1844,7 @@ static int do_scan(bool verbose) {
         }
 
         char tgt[256];
-        snprintf(tgt, sizeof(tgt), "%s/thermal_zone%ld/temp", ZONE_ROOT, z);
+        snprintf(tgt, sizeof(tgt), "%s/temp", zone_path_of(z).c_str());
 
         // 探测前剥掉自己的挂载，否则读到 350 伪装值，看不出跟不跟随
         bool was_mounted = is_mounted(tgt);
@@ -1657,7 +1858,7 @@ static int do_scan(bool verbose) {
         // 恢复挂载，并校验真的挂回去了（失败要留痕，不能静默丢伪装）
         if (was_mounted) {
             char fz[320];
-            snprintf(fz, sizeof(fz), "%s/thermal_zone%ld", FAKE_DIR, z);
+            snprintf(fz, sizeof(fz), "%s", zone_fake_path_of(z).c_str());
             if (access(fz, F_OK) == 0) {
                 if (mount(fz, tgt, nullptr, MS_BIND, nullptr) != 0 || !is_mounted(tgt)) {
                     n_mount_bad++;
@@ -2370,7 +2571,7 @@ static int wall_real_batt_temp() {
     // ② 新鲜快照（dump 等独立进程）
     if (z >= 0) {
         char p[256];
-        snprintf(p, sizeof(p), "%s/thermal_zone%ld", REAL_DIR, z);
+        snprintf(p, sizeof(p), "%s", zone_real_path_of(z).c_str());
         // 必须用 snapshot_fresh() 的三重判据，不能再用 time(nullptr)-st_mtime：
         // 这是安全关键路径（温度墙据它决定限流档位），
         // 系统时间跳回过去时 age 变负 → 快照被丢弃 → 返回 0 → 温度墙静默停用。
@@ -2728,13 +2929,10 @@ static int read_real(const char *zone) {
 // 前置声明：read_best 定义在下方，real_or_zone 需要先用（v1.4.5）
 static int read_best(long z);
 
-// zone 编号 → REAL_DIR 下的文件名。
-// apply 写快照用 e->d_name（thermal_zone<N>），flush_real_values 也用同样格式，
-// 所以 read_real 的入参必须是 "thermal_zone<N>"。
+// zone 编号 → 真实目录名（v1.4.7e：查注册表，兼容改名目录）
+// 原来一律拼 thermal_zone%ld，改名目录会拼出不存在的路径。
 static std::string zone_name_of(long z) {
-    char b[40];
-    snprintf(b, sizeof(b), "thermal_zone%ld", z);
-    return std::string(b);
+    return zone_dir_name(z);
 }
 
 // 取某个 zone 的真实温度：优先 REAL_DIR 快照，退回直接读节点。
@@ -2855,6 +3053,7 @@ static void open_real_fds() {
         if (g_real_fd.count(zn)) continue;
         char p[256];
         snprintf(p, sizeof(p), "%s/%s/temp", ZONE_ROOT, e->d_name);
+        zn_register(e->d_name);
         int fd = open(p, O_RDONLY | O_CLOEXEC);
         if (fd >= 0) g_real_fd[zn] = fd;
     }
@@ -2893,12 +3092,12 @@ static int read_best(long zn) {
 
     char p[256];
     if (snapshot_fresh()) {
-        snprintf(p, sizeof(p), "%s/thermal_zone%ld", REAL_DIR, zn);
+        snprintf(p, sizeof(p), "%s", zone_real_path_of(zn).c_str());
         if (read_int(p, &v) && v > 0) return v;
     }
 
     // ③ sysfs：只有确认未被伪装才可信
-    snprintf(p, sizeof(p), "%s/thermal_zone%ld/temp", ZONE_ROOT, zn);
+    snprintf(p, sizeof(p), "%s/temp", zone_path_of(zn).c_str());
     if (is_mounted(p)) return 0;        // 已被本模块接管，读到的是假值，不能当真实值
     if (read_int(p, &v) && v > 0) return v;
     return 0;
@@ -2911,22 +3110,18 @@ static int cpu_core_temps(int *out, int maxn) {
     long zs[64];
     int  keys[64];
     int  zn = 0;
-    DIR *d = opendir(ZONE_ROOT);
-    if (!d) return 0;
-    struct dirent *e;
-    while ((e = readdir(d)) && zn < 64) {
-        if (strncmp(e->d_name, "thermal_zone", 12) != 0) continue;
-        std::string tp = std::string(ZONE_ROOT) + "/" + e->d_name + "/type";
-        std::string t;
-        if (!read_str(tp.c_str(), t)) continue;
+    // v1.4.7f：走统一枚举层，改名 CPU zone 也能参与（原 strncmp+atol 硬门槛已废）
+    g_cc.zs = zs; g_cc.keys = keys; g_cc.zn = &zn;
+    enum_zones([](long zone, const char *name, const std::string &t, void *ud) {
+        (void)name; (void)ud;
+        if (*(g_cc.zn) >= 64) return;
         int a = -1, b = -1;
         // 只接受 cpu-N-M-* 形式，自动排除 cpu-hw-trip-N / cpu_therm
-        if (sscanf(t.c_str(), "cpu-%d-%d-", &a, &b) != 2) continue;
-        keys[zn] = a * 100 + b;
-        zs[zn]   = atol(e->d_name + 12);
-        zn++;
-    }
-    closedir(d);
+        if (sscanf(t.c_str(), "cpu-%d-%d-", &a, &b) != 2) return;
+        g_cc.keys[*(g_cc.zn)] = a * 100 + b;
+        g_cc.zs[*(g_cc.zn)]   = zone;
+        (*(g_cc.zn))++;
+    }, nullptr);
 
     // 去重 + 按 (cluster, core) 升序
     int uk[64], un = 0;
@@ -2949,6 +3144,20 @@ static int cpu_core_temps(int *out, int maxn) {
         }
         out[n++] = mx;
     }
+
+    // v1.4.7 兜底：一个 cpu-N-M 都没匹配到时，退回「所有含 cpu 且非 trip」
+    // 的节点，按编号升序取前 maxn 个。保证换机型也能显示每核温度，
+    // 而不是整片 "--"。
+    if (n == 0) {
+        long tmp[64];
+        int m = zones_by_prefix("cpu", tmp, 64);
+        for (int i = 0; i < m && n < maxn; i++) {
+            int v = read_best(tmp[i]);
+            out[n++] = v > 0 ? v : 0;
+        }
+        if (n > 0)
+            logf("[cpu] 未匹配 cpu-N-M 格式，退回通用 cpu* 聚合，命中 %d 个", n);
+    }
     return n;
 }
 
@@ -2958,14 +3167,13 @@ static void flush_real_values() {
     long zones[64];
     int n = 0;
 
-    // CPU：cpu-0-x / cpu-1-x（真实核心温度，不带 hw-trip）
+    // v1.4.7：CPU/GPU 改用词根匹配，不再硬编码 "cpu-0-"/"cpu-1-"/"gpuss-"。
+    // 原写法换机型必然漏（cpu0-therm / gpu_therm 之类全部匹配不上），
+    // 导致快照里没有这些 zone，WebUI 读真实温度就是 "--"。
     long tmp[64];
-    int m = zones_by_prefix("cpu-0-", tmp, 64);
+    int m = zones_by_root("cpu", CPU_EXCL, tmp, 64);
     for (int i = 0; i < m && n < 64; i++) zones[n++] = tmp[i];
-    m = zones_by_prefix("cpu-1-", tmp, 64);
-    for (int i = 0; i < m && n < 64; i++) zones[n++] = tmp[i];
-    // GPU：gpuss-*
-    m = zones_by_prefix("gpuss-", tmp, 64);
+    m = zones_by_root("gpu", GPU_EXCL, tmp, 64);
     for (int i = 0; i < m && n < 64; i++) zones[n++] = tmp[i];
     // 电池 / 充电口 / 主板（按 type 名查，不硬编码编号）
     static const char *SINGLE[] = {
@@ -2986,7 +3194,7 @@ static void flush_real_values() {
         int v = read_live_real(zn);
         if (v <= 0) continue;
         char p[256];
-        snprintf(p, sizeof(p), "%s/thermal_zone%ld", REAL_DIR, zn);
+        snprintf(p, sizeof(p), "%s", zone_real_path_of(zn).c_str());
         int fd = open(p, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
         if (fd < 0) continue;
         char b[16];
@@ -3005,6 +3213,252 @@ static void flush_real_values() {
 
 // ============ dump（WebUI 用）============
 
+// ============ 只读 sysfs 节点语义解析（v1.4.7）============
+//
+// 为什么需要这层（用户要求「充电电流等节点改名也要能读」）：
+//   dump_json 里原来有 9 处完全硬编码的路径，换机型或改名就静默读不到，
+//   WebUI 显示 0 或 "--"。zone 层已统一成「语义 + 结构识别」，
+//   这几个 sysfs 节点也必须走同一套口径，否则架构是割裂的。
+//
+// 与 cn_resolve 的区别：
+//   cn_resolve 面向「充电控制节点」，偏好可写（要能写进去才有效）；
+//   本层面向「只读观测节点」，只要求可读。
+//   打分规则完全沿用：精确 100 / 别名 85 / 前缀 75 / 包含 65 / 后缀 55。
+//
+// 安全阀：模糊层必须落在电源语义目录内，否则会被同名文件骗到
+//   （实测 /sys/class/power_supply/xxx/current_now 与
+//         /sys/class/xm_power/xxx/current_now 同名）。
+
+struct RoSpec {
+    const char *key;
+    const char *known;
+    const char *const *alias;
+    const char *kw;
+    const char *dir_allow;
+    // 目录名别名表（v1.4.7d）：解决 usb/ 与 battery/ 下同名 voltage_now 串读。
+    const char *const *dir_alias;
+};
+
+static const char *AL_USB_CURRENT[] = {
+    "current_now", "input_current_now", "usb_current",
+    "chg_current_now", "current_max", nullptr
+};
+static const char *AL_USB_VOLTAGE[] = {
+    "voltage_now", "input_voltage_now", "usb_voltage", nullptr
+};
+static const char *AL_BAT_VOLTAGE[] = {
+    "voltage_now", "batt_voltage_now", "vbat", nullptr
+};
+static const char *AL_BAT_CURRENT[] = {
+    "current_now", "batt_current_now", "ibat", nullptr
+};
+static const char *AL_BAT_CAPACITY[] = {
+    "capacity", "capacity_level", "soc", nullptr
+};
+static const char *AL_BAT_STATUS[] = {
+    "status", "batt_status", "charge_status", nullptr
+};
+static const char *AL_CP_BATT_TEMP[] = {
+    "batt_temp", "cp_temp", "charger_temp", nullptr
+};
+static const char *AL_CP_IBUS[] = {
+    "ibus", "input_current", "cp_ibus", nullptr
+};
+static const char *AL_KGSL_TEMP[] = {
+    "temp", "gpu_temp", nullptr
+};
+// 电池电源侧温度（power_supply/battery/temp 一类）
+static const char *AL_BAT_TEMP[] = {
+    "temp", "batt_temp", "battery_temp", "batt_therm", "temp_now", nullptr
+};
+// 目录名别名表：同类节点在不同厂商下的目录命名
+static const char *DA_USB[] = {
+    "usb", "pc_port", "usbpd", "typec", "type_c", "main_chg", "chg", "charger", nullptr
+};
+static const char *DA_BAT[] = {
+    "battery", "main_batt", "batt", "bat", "bms", "vbat", nullptr
+};
+static const char *DA_CP[] = {
+    "cp_master", "charge_pump", "cp", "charger", "main_chg", nullptr
+};
+static const char *DA_KGSL[] = {
+    "kgsl-3d0", "kgsl", "kgsl-3d", "gpu", "gpu_dev", nullptr
+};
+
+static std::string ro_full(const char *sub) { return g_root + sub; }
+
+// 已分配给其它 key 的路径（互斥占用，防两个字段读同一节点）
+static std::vector<std::string> g_ro_used;
+
+// 目录名与别名表是否命中（按 sem_stem 归一化后双向包含）
+static bool ro_dir_hit(const std::string &path, const char *const *tbl) {
+    if (!tbl) return false;
+    size_t sl = path.rfind('/');
+    if (sl == std::string::npos) return false;
+    std::string d = path.substr(0, sl);
+    size_t sl2 = d.rfind('/');
+    if (sl2 != std::string::npos) d = d.substr(sl2 + 1);
+    std::string ds = sem_stem(d);
+    if (ds.empty()) return false;
+    for (int i = 0; tbl[i]; i++) {
+        std::string a = sem_stem(tbl[i]);
+        if (a.empty()) continue;
+        if (ds == a || ds.find(a) != std::string::npos || a.find(ds) != std::string::npos)
+            return true;
+    }
+    return false;
+}
+
+static std::string cn_resolve_ro(const RoSpec &sp, const std::string &known) {
+    if (known.empty()) return std::string();
+    // 已知路径存在且未被其它 key 占用 → 直接用（100 分权威）
+    if (node_readable(known)) {
+        bool used = false;
+        for (auto &u : g_ro_used) if (u == known) { used = true; break; }
+        if (!used) { g_ro_used.push_back(known); return known; }
+    }
+
+    cn_refresh_cache();
+    std::string best;
+    int  best_score = -1;
+
+    std::string kfn;      // known 尾名
+    std::string kdn;      // known 目录名（归一化）
+    if (sp.known) {
+        size_t ks = sp.known ? std::string(sp.known).rfind('/') : std::string::npos;
+        if (ks != std::string::npos) {
+            kfn = std::string(sp.known).substr(ks + 1);
+            std::string kd = std::string(sp.known).substr(0, ks);
+            size_t k2 = kd.rfind('/');
+            if (k2 != std::string::npos) kd = kd.substr(k2 + 1);
+            kdn = sem_stem(kd);
+        }
+    }
+
+    for (size_t i = 0; i < g_cn_scan_cache.size(); i++) {
+        const std::string &p = g_cn_scan_cache[i];
+        if (!node_readable(p)) continue;
+        size_t slash = p.rfind('/');
+        if (slash == std::string::npos) continue;
+        std::string fn = p.substr(slash + 1);
+        std::string cdir = p.substr(0, slash);
+        size_t s2 = cdir.rfind('/');
+        std::string cdn = sem_stem(s2 == std::string::npos ? cdir : cdir.substr(s2 + 1));
+
+        // 目录证据：0 无 / 1 与 known 目录语义相关 / 2 命中目录别名表
+        int dev = 0;
+        if (ro_dir_hit(p, sp.dir_alias)) dev = 2;
+        else if (!kdn.empty() && !cdn.empty() &&
+                 (kdn == cdn || kdn.find(cdn) != std::string::npos ||
+                  cdn.find(kdn) != std::string::npos)) dev = 1;
+
+        int score = -1;
+        bool exact = false;
+        if (!kfn.empty() && fn == kfn) {
+            if (p == known)      { score = 100; exact = true; }
+            else if (dev == 2)   { score = 96;  exact = true; }
+            else if (dev == 1)   { score = 94;  exact = true; }
+            else                 { score = 70; }   // 无目录证据：压到别名之下
+        }
+        if (score < 0 && sp.alias) {
+            for (int a = 0; sp.alias[a]; a++)
+                if (fn == sp.alias[a]) {
+                    score = (dev >= 1) ? 90 : 84;
+                    exact = true;
+                    break;
+                }
+        }
+        if (score < 0 && sp.kw && *sp.kw) {
+            std::string kw = sp.kw;
+            if (fn.find(kw) != std::string::npos) {
+                if (fn.compare(0, kw.size(), kw) == 0)                        score = 75;
+                else if (fn.size() >= kw.size() &&
+                         fn.compare(fn.size()-kw.size(), kw.size(), kw) == 0) score = 55;
+                else                                                          score = 65;
+            }
+        }
+        if (score < 0) continue;
+        // 目录闸门（v1.4.7f 收紧）：dir_allow 是硬约束，任何分数都必须落在该语义路径内。
+        //   反例：bat_temp 的 known 是 power_supply/battery/temp，
+        //         原先只在模糊层卡目录 → 命中了 thermal/xiaomi_batt/temp
+        //         （0.001℃ 刻度 43500），按 0.1℃ 语义用会差 10 倍。
+        if (sp.dir_allow && *sp.dir_allow) {
+            if (p.find(sp.dir_allow) == std::string::npos) continue;
+        }
+        if (cn_avoided(p, CN_AVOID_COMMON)) continue;
+        // 互斥占用：非 100 分不得复用其它 key 已占路径
+        if (score < 100) {
+            bool used = false;
+            for (auto &u : g_ro_used) if (u == p) { used = true; break; }
+            if (used) continue;
+        }
+        if (score > best_score) { best_score = score; best = p; }
+    }
+    if (!best.empty()) {
+        g_ro_used.push_back(best);
+        logf("[ro-node] %s：语义命中 %s（得分 %d）", sp.key, best.c_str(), best_score);
+        return best;
+    }
+    logf("[ro-node] %s：全部未命中，返回空（上层显示 0/--）", sp.key);
+    return std::string();
+}
+
+struct RoCache { std::string key; std::string path; };
+static std::vector<RoCache> g_ro_cache;
+static bool g_ro_ready = false;
+
+static const char *ro_get(const char *key) {
+    for (auto &c : g_ro_cache)
+        if (c.key == key) return c.path.empty() ? nullptr : c.path.c_str();
+    return nullptr;
+}
+
+static void ro_init() {
+    if (g_ro_ready) return;
+    g_ro_ready = true;
+    RoSpec specs[] = {
+        { "usb_current", "/sys/class/power_supply/usb/current_now",
+          AL_USB_CURRENT,  "current",  "power_supply", DA_USB },
+        { "usb_voltage", "/sys/class/power_supply/usb/voltage_now",
+          AL_USB_VOLTAGE,  "voltage",  "power_supply", DA_USB },
+        { "bat_voltage", "/sys/class/power_supply/battery/voltage_now",
+          AL_BAT_VOLTAGE,  "voltage",  "power_supply", DA_BAT },
+        { "bat_current", "/sys/class/power_supply/battery/current_now",
+          AL_BAT_CURRENT,  "current",  "power_supply", DA_BAT },
+        { "bat_capacity","/sys/class/power_supply/battery/capacity",
+          AL_BAT_CAPACITY, "capacity", "power_supply", DA_BAT },
+        { "bat_status",  "/sys/class/power_supply/battery/status",
+          AL_BAT_STATUS,   "status",   "power_supply", DA_BAT },
+        { "bat_temp",    "/sys/class/power_supply/battery/temp",
+          AL_BAT_TEMP,     "temp",     "power_supply", DA_BAT },
+        { "cp_batt_temp","/sys/class/xm_power/cp_master/batt_temp",
+          AL_CP_BATT_TEMP, "batt_temp","xm_power",      DA_CP },
+        { "cp_ibus",     "/sys/class/xm_power/cp_master/ibus",
+          AL_CP_IBUS,      "ibus",     "xm_power",      DA_CP },
+        { "kgsl_temp",   "/sys/class/kgsl/kgsl-3d0/temp",
+          AL_KGSL_TEMP,    "temp",     "kgsl",          DA_KGSL },
+    };
+    for (auto &sp : specs) {
+        std::string p = cn_resolve_ro(sp, ro_full(sp.known));
+        g_ro_cache.push_back({ sp.key, p });
+    }
+}
+
+static bool ro_read_int(const char *key, int *out) {
+    ro_init();
+    const char *p = ro_get(key);
+    if (!p) return false;
+    return read_int(p, out);
+}
+
+static bool ro_read_str(const char *key, std::string &out) {
+    ro_init();
+    const char *p = ro_get(key);
+    if (!p) return false;
+    return read_str(p, out);
+}
+
+// ============ dump（WebUI 用）============
 static void dump_json() {
     // 已伪装节点数 = 挂了 mount 的 thermal_zone 唯一目标数
     // 一次性扫描 mountinfo 统计（原来对 97 个 zone 各调一次 is_mounted，共 97 次 fopen）
@@ -3066,9 +3520,9 @@ static void dump_json() {
     int real_bt = 0;
     {
         int cp_raw = 0;
-        read_int("/sys/class/xm_power/cp_master/batt_temp", &cp_raw);
+        ro_read_int("cp_batt_temp", &cp_raw);
         int cp_ibus = 0;
-        read_int("/sys/class/xm_power/cp_master/ibus", &cp_ibus);
+        ro_read_int("cp_ibus", &cp_ibus);
         bool cp_idle = (cp_ibus <= 10);
 
         // cp_master 单位是 0.01℃，有效范围 10.00~99.99℃（1000~9999）
@@ -3095,8 +3549,9 @@ static void dump_json() {
     // 这里对有 REAL_DIR 快照的 cpu zone 逐个覆盖成真值。
     {
         static long zl[64];
-        int zn2 = zones_by_prefix("cpu-0-", zl, 64);
-        int zn3 = zones_by_prefix("cpu-1-", zl + zn2, 64 - zn2);
+        // v1.4.7：改用词根匹配，与 flush_real_values 口径一致
+        int zn2 = zones_by_root("cpu", CPU_EXCL, zl, 64);
+        int zn3 = 0;   // 已合并到一次词根查找，保留变量避免改动下方逻辑
         int ztot = zn2 + zn3;
         for (int i = 0; i < ztot && i < cpu_cnt; i++) {
             std::string nm = zone_name_of(zl[i]);
@@ -3108,7 +3563,7 @@ static void dump_json() {
     int gpu_real = 0;
     {
         long tmp[32];
-        int m = zones_by_prefix("gpuss-", tmp, 32);
+        int m = zones_by_root("gpu", GPU_EXCL, tmp, 32);
         for (int i = 0; i < m; i++) {
             std::string zn = zone_name_of(tmp[i]);
             int v = real_or_zone(tmp[i], zn.c_str());
@@ -3121,7 +3576,7 @@ static void dump_json() {
         if (z >= 0) { std::string n = zone_name_of(z); cpu_therm_real = real_or_zone(z, n.c_str()); }
     }
     int gpu_kgsl = 0;
-    read_int("/sys/class/kgsl/kgsl-3d0/temp", &gpu_kgsl);
+    ro_read_int("kgsl_temp", &gpu_kgsl);
     // 电池 / 充电口：按 type 名查找
     // batt_real 取 batt_therm（独立 NTC，不受 fake_temp 影响）
     int batt_real = 0, chg_real = 0, conn_real = 0;
@@ -3136,7 +3591,9 @@ static void dump_json() {
     // 电池组：batt_therm 是独立 NTC（真实）；battery/batt_temp 会被 fake_temp 改写。
     // 因此 batt_real 取 batt_therm，batt_drv 只作参考。
     int batt_ps = 0, batt_drv = 0, batt_ntc = 0;
-    read_int(N_BATT_TEMP, &batt_ps);
+    // 走只读语义层（0.1℃ 刻度，与原 N_BATT_TEMP 语义一致）
+    if (!ro_read_int("bat_temp", &batt_ps))
+        read_int(N_BATT_TEMP, &batt_ps);   // 语义层未命中时退回已知路径
     {
         long z = zone_by_type("batt_therm");
         if (z >= 0) { std::string n = zone_name_of(z); batt_ntc = real_or_zone(z, n.c_str()); }
@@ -3146,16 +3603,16 @@ static void dump_json() {
 
     // 充电功率
     int usb_v = 0, usb_i = 0, bat_v = 0, bat_i = 0;
-    read_int("/sys/class/power_supply/usb/voltage_now", &usb_v);
-    read_int("/sys/class/power_supply/usb/current_now", &usb_i);
-    read_int("/sys/class/power_supply/battery/voltage_now", &bat_v);
-    read_int("/sys/class/power_supply/battery/current_now", &bat_i);
+    ro_read_int("usb_voltage", &usb_v);
+    ro_read_int("usb_current", &usb_i);
+    ro_read_int("bat_voltage", &bat_v);
+    ro_read_int("bat_current", &bat_i);
 
     int cap = 0;
-    read_int("/sys/class/power_supply/battery/capacity", &cap);
+    ro_read_int("bat_capacity", &cap);
 
     std::string status;
-    read_str("/sys/class/power_supply/battery/status", status);
+    ro_read_str("bat_status", status);
 
     // 守护进程存活
     // ⚠ 不能只看 /proc/<pid> 是否存在：PID 会被内核复用。
