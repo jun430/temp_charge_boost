@@ -154,6 +154,12 @@ static std::vector<std::string> g_cn_miss;
 static void init_paths() {
     // TCB_ROOT 只影响 sysfs 那部分，工作目录单独用 TCB_WORK 覆盖
     g_root = env_or("TCB_ROOT", "");
+    // v1.4.8 fix6: 规范化 g_root —— 去掉结尾的 '/'。
+    // 原来 TCB_ROOT=/ 会拼出 "//sys/devices/..."（双斜杠），
+    // 与 mountinfo 里的单斜杠路径 strncmp 不匹配，
+    // 导致 status/dump 的已伪装节点数恒为 0（即使实际挂了 86 个）。
+    while (!g_root.empty() && g_root[g_root.size() - 1] == '/')
+        g_root.erase(g_root.size() - 1);
     std::string R = g_root;
 
     g_work = env_or("TCB_WORK", R + "/data/adb/temp_charge_boost");
@@ -1726,6 +1732,7 @@ static int  read_live_real(long zn);
 // 前向声明：wall_real_batt_temp()（约 1535 行）在 snapshot_fresh() 定义（约 1960 行）
 // 之前就用到它。温度墙必须与 dump 用同一套新鲜度判据，否则两条路径判定不一致。
 static bool snapshot_fresh();
+static int read_target_temp(std::string *src);   // v1.4.8: read_real/flush need target for sanity check
 
 static int do_scan(bool verbose) {
     logf("[scan] === 开始扫描温度节点 ===");
@@ -2635,6 +2642,28 @@ static bool daemon_running() {
     return strstr(cb, "temp_charge_boost") && strstr(cb, "daemon");
 }
 
+
+// v1.4.8: apply 后确保 daemon 在跑。
+// daemon 原先只在 post-fs-data.sh / service.sh 两个开机时机启动；
+// 被 LMK 回收或手动 kill 后 WebUI 点应用伪装只会重挂节点、不拉守护进程，
+// 表现为挂载生效但温度墙/充电限流纠正全部失效，必须重启才能恢复。
+static void spawn_daemon_if_needed(const char *self) {
+    if (daemon_running()) return;
+    pid_t p = fork();
+    if (p < 0) { logf("[apply] spawn daemon failed: fork %s", strerror(errno)); return; }
+    if (p == 0) {
+        setsid();
+        int dn = open("/dev/null", O_RDWR);
+        if (dn >= 0) { dup2(dn, 0); dup2(dn, 1); dup2(dn, 2); if (dn > 2) close(dn); }
+        char *nargv[3];
+        nargv[0] = const_cast<char *>(self);
+        nargv[1] = const_cast<char *>("daemon");
+        nargv[2] = nullptr;
+        execv(self, nargv);
+        _exit(127);
+    }
+    logf("[apply] daemon not running, spawned pid=%d", (int)p);
+}
 // 每轮调用：充电时执行温度墙判定，必要时写上限；降温后恢复
 // 配置从 wall.conf 读取（"启用 阈值x10" 两字段），WebUI 改完即时生效
 // 温度墙档位 0 = 不限流，此时应解除 IC 级温度限流（OS4）；
@@ -2918,11 +2947,22 @@ static void show_status() {
 }
 
 // 读取 REAL_DIR 中记录的真实值（挂载前快照）
+// v1.4.8 fix1: 必须校验新鲜度与合理性。原实现只要文件存在就返回，
+//   一旦 flush 写入过伪装值（如 350），该 zone 就永远显示 350，
+//   WebUI 上表现为「核心 0.3度」，且永远不会自愈。
 static int read_real(const char *zone) {
+    if (!zone || !*zone) return 0;
+    // 快照必须新鲜（同 boot_id 且 120s 内刷新）；陈旧快照直接当作没有
+    if (!snapshot_fresh()) return 0;
+    // 与伪装目标值完全相同 -> 极可能是假值污染的快照，拒绝
+    int tgt = read_target_temp(nullptr);
     char p[256];
     snprintf(p, sizeof(p), "%s/%s", REAL_DIR, zone);
     int v = 0;
     if (!read_int(p, &v)) return 0;
+    // 合理性：0.001 度刻度下，电芯温度不可能低于 -20 度或高于 120 度
+    if (v < -20000 || v > 120000) return 0;
+    if (tgt > 0 && v == tgt) return 0;
     return v;
 }
 
@@ -3055,7 +3095,29 @@ static void open_real_fds() {
         snprintf(p, sizeof(p), "%s/%s/temp", ZONE_ROOT, e->d_name);
         zn_register(e->d_name);
         int fd = open(p, O_RDONLY | O_CLOEXEC);
-        if (fd >= 0) g_real_fd[zn] = fd;
+        if (fd < 0) {
+            logf("[fd] open %s failed: %s", p, strerror(errno));
+            continue;
+        }
+        // v1.4.8 fix5: 开完立即验证读到的是真值。
+        // 实测根因：daemon 持有 fd 会使 umount 返回 EBUSY，
+        // restore_temp() 卸不干净 -> 此处打开的就是伪装文件。
+        // 若读到的值恰好等于伪装目标，说明没卸净，丢弃该 fd。
+        {
+            int tgt = read_target_temp(nullptr);
+            char vb[32];
+            ssize_t vn = pread(fd, vb, sizeof(vb) - 1, 0);
+            if (vn > 0) {
+                vb[vn] = 0;
+                int v = atoi(vb);
+                if (v <= 0 || (tgt > 0 && v == tgt) || v < -20000 || v > 120000) {
+                    logf("[fd] %s suspicious value %d (target %d), mount not clean, skip", p, v, tgt);
+                    close(fd);
+                    continue;
+                }
+            }
+        }
+        g_real_fd[zn] = fd;
     }
     closedir(d);
 }
@@ -3086,20 +3148,34 @@ static int read_live_real(long zn) {
 //   伪装值（350），却被当成"真实温度"显示，WebUI 上真实温度全是 0.3℃。
 //   这比返回 0 更糟：0 至少能看出"读不到"，假值会被当真。
 //   所以节点若已挂载我们的假值文件，就不能拿 sysfs 当真实值，直接返回 0。
+// v1.4.8 fix4: 三条取数路径统一做「伪装值识别」。
+//   原实现只挡住 ③ sysfs，但 ① fd 和 ② 快照都可能拿到 350：
+//   fd 若在已挂载状态下打开，pread 就是假值；快照被污染的修复见 fix1/fix2。
+//   这里统一收口：任何一条路径读到「恰好等于伪装目标」的值都视为无效。
 static int read_best(long zn) {
+    int tgt = read_target_temp(nullptr);
+    auto suspect = [tgt](int v) {
+        if (v <= 0) return true;
+        if (v < -20000 || v > 120000) return true;      // 超出物理范围
+        if (tgt > 0 && v == tgt) return true;            // 恰好等于伪装值
+        return false;
+    };
+
     int v = read_live_real(zn);
-    if (v > 0) return v;
+    if (!suspect(v)) return v;
 
     char p[256];
     if (snapshot_fresh()) {
         snprintf(p, sizeof(p), "%s", zone_real_path_of(zn).c_str());
-        if (read_int(p, &v) && v > 0) return v;
+        v = 0;
+        if (read_int(p, &v) && !suspect(v)) return v;
     }
 
-    // ③ sysfs：只有确认未被伪装才可信
+    // sysfs：只有确认未被伪装才可信
     snprintf(p, sizeof(p), "%s/temp", zone_path_of(zn).c_str());
-    if (is_mounted(p)) return 0;        // 已被本模块接管，读到的是假值，不能当真实值
-    if (read_int(p, &v) && v > 0) return v;
+    if (is_mounted(p)) return 0;
+    v = 0;
+    if (read_int(p, &v) && !suspect(v)) return v;
     return 0;
 }
 
@@ -3193,6 +3269,12 @@ static void flush_real_values() {
         long zn = zones[i];
         int v = read_live_real(zn);
         if (v <= 0) continue;
+        // v1.4.8 fix2: fd 若是在已挂载状态下打开的，读到的是假值。
+        // 直接写入快照会造成正反馈污染：一次写 350 + 刷 meta，整层永久失效。
+        {
+            int tgt = read_target_temp(nullptr);
+            if (tgt > 0 && v == tgt) continue;   // 等于伪装目标 -> fd 指向假值文件
+        }
         char p[256];
         snprintf(p, sizeof(p), "%s", zone_real_path_of(zn).c_str());
         int fd = open(p, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
@@ -3743,6 +3825,8 @@ int main(int argc, char **argv) {
     else if (!strcmp(cmd, "apply")) {
         // apply_temp 返回成功挂载的节点数：>0 成功，==0 一个都没挂上（失败），<0 参数非法
         int n = apply_temp(argc > 2 ? atoi(argv[2]) : DEF_TEMP);
+        // v1.4.8: 挂载成功后自愈守护进程（daemon 被 kill 后不必重启）
+        if (n > 0) spawn_daemon_if_needed(argv[0]);
         return n > 0 ? 0 : 1;
     }
     else if (!strcmp(cmd, "restore")) { restore_temp(); return 0; }
