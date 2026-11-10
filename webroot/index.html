@@ -443,6 +443,37 @@ footer{text-align:center;font-size:11.5px;color:var(--text2);padding:14px 0 4px;
     <div class="bar"><div class="bar-fill" id="capBar" style="width:0%"></div></div>
   </div>
 
+  <!-- 电池循环次数（v1.4.9） -->
+  <div class="card fade" id="cycleCard">
+    <div class="card-title">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 12a9 9 0 1 1-3-6.7"/><path d="M21 3v6h-6"/></svg>
+      电池循环次数
+      <span style="flex:1"></span>
+      <span class="pill" style="font-size:11.5px" id="cyPill">--</span>
+    </div>
+    <div class="grid" style="margin-bottom:10px">
+      <div class="item">
+        <div class="k">系统读取</div>
+        <div class="v accent" id="cyNow">--<small>次</small></div>
+      </div>
+      <div class="item">
+        <div class="k">真实次数</div>
+        <div class="v" id="cyReal">--<small>次</small></div>
+      </div>
+    </div>
+    <div class="wall-row">
+      <div class="k">伪装为</div>
+      <div class="wall-slider-wrap">
+        <input type="range" id="cyRange" min="0" max="200" step="1" value="0"
+               oninput="onCyInput(this.value)" onchange="setCycle(this.value)">
+        <div class="wall-val"><b id="cyVal">关</b></div>
+      </div>
+    </div>
+    <div class="hero-hint" style="margin-top:10px;font-size:12px" id="cyHint">
+      拖到 0 即关闭伪装，节点恢复真实次数
+    </div>
+  </div>
+
   <!-- 操作 -->
   <div class="btns">
     <button class="btn btn-primary" onclick="act('apply')">
@@ -863,6 +894,39 @@ function onWallInput(v){
 }
 
 // 松手才落盘
+// ===== 电池循环次数（v1.4.9）=====
+let CY_DRAG = false;   // 拖动中不覆盖滑块，避免用户手还在拖被 refresh 拉回
+
+function onCyInput(v){
+  CY_DRAG = true;
+  const n = parseInt(v, 10);
+  const el = document.getElementById('cyVal');
+  if (el) el.textContent = (n > 0) ? (n + ' 次') : '关';
+}
+
+async function setCycle(v){
+  CY_DRAG = false;
+  const n = parseInt(v, 10);
+  if (isNaN(n) || n < 0 || n > 9999){
+    toast('范围 0~9999（0 = 关闭）');
+    return;
+  }
+  try{
+    const r = await sh(BIN + ' setcycle ' + n);
+    // 后端返回 JSON，失败要明确提示，不能静默。
+    // 注意：sh() 的输出可能经过 HTML 转义（引号变成 "），
+    // 所以判据用不含引号的子串，不要写 "ok":false 这种带引号的匹配。
+    if (r && r.indexOf('ok') >= 0 && r.indexOf('false') >= 0){
+      if (r.indexOf('not_number') >= 0) toast('不是合法数字');
+      else if (r.indexOf('range') >= 0) toast('范围 0~9999');
+      else toast('设置失败');
+    } else {
+      toast(n > 0 ? ('循环次数已伪装为 ' + n + ' 次') : '已关闭循环次数伪装');
+    }
+  }catch(e){ console.error(e); toast('执行失败：' + e); }
+  setTimeout(refresh, 400);
+}
+
 async function setWall(v){
   WALL_DRAG = false;
   const n = parseInt(v, 10);
@@ -960,6 +1024,45 @@ async function refresh(){
     renderWall(d);
 
     // 电池
+    // ===== 电池循环次数（v1.4.9）=====
+    {
+      const cyT = (typeof d.cycle_target === 'number') ? d.cycle_target : 0;
+      const cyN = (typeof d.cycle_now === 'number') ? d.cycle_now : 0;
+      const cyR = (typeof d.cycle_real === 'number') ? d.cycle_real : 0;
+      const cyM = (d.cycle_masked === true);
+      const cyP = (typeof d.cycle_ports === 'number') ? d.cycle_ports : 0;
+
+      const eN = document.getElementById('cyNow');
+      const eR = document.getElementById('cyReal');
+      const eP = document.getElementById('cyPill');
+      const eH = document.getElementById('cyHint');
+      const eS = document.getElementById('cyRange');
+      const eV = document.getElementById('cyVal');
+
+      if (eN) eN.innerHTML = cyN + '<small>次</small>';
+      if (eR) eR.innerHTML = (cyR > 0 ? cyR : '--') + '<small>次</small>';
+
+      if (eP){
+        if (cyP === 0){ eP.textContent = '不支持'; eP.style.color = 'var(--muted)'; }
+        else if (cyM){ eP.textContent = '伪装中'; eP.style.color = 'var(--green)'; }
+        else { eP.textContent = '未伪装'; eP.style.color = 'var(--muted)'; }
+      }
+
+      if (eH){
+        if (cyP === 0) eH.textContent = '本机未找到循环次数节点，此功能不可用';
+        else if (cyM) eH.textContent = '已伪装为 ' + cyT + ' 次，系统读到 ' + cyN + ' 次';
+        else if (cyT > 0) eH.textContent = '目标 ' + cyT + ' 次但未生效，请点「应用伪装」';
+        else eH.textContent = '当前未伪装，节点显示真实次数';
+      }
+
+      // 拖动中不覆盖，避免手还在拖被 refresh 拉回
+      if (!CY_DRAG && eS){
+        eS.max = String(Math.max(200, cyT, cyR));
+        eS.value = String(cyT);
+        if (eV) eV.textContent = (cyT > 0) ? (cyT + ' 次') : '关';
+      }
+    }
+
     document.getElementById('cap').textContent = d.capacity;
     document.getElementById('capBar').style.width = d.capacity + '%';
     const sp = document.getElementById('statusPill');

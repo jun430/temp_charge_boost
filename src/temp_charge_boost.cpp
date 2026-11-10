@@ -57,6 +57,8 @@ static std::string g_n_usb_online;
 static std::string g_n_batt_stat;
 static std::string g_n_wired_curr;
 static std::string g_n_thermal_rm;   // OS4: wired_thermal_remove（充电温度限制解除标志）
+static std::string g_n_cycle_count;  // v1.4.9: 电池循环次数节点（可写口，优先 fg_master）
+static std::string g_n_cycle_count2; // v1.4.9: 循环次数第二节点（battery 侧只读口，尽力伪装）
 static std::string g_zone_root;
 static std::string g_zone_class;
 
@@ -107,6 +109,13 @@ static const char *AL_FAKE_TEMP[] = {
     "sim_temp",
     "simulate_temp",
     nullptr
+};
+// 电池循环次数（v1.4.9）：定义必须早于 init_paths() 的 CN_DEFINE 使用点
+//   cycle_count   AOSP power_supply 标准属性（battery 侧，只读）
+//   cyclecount    小米 xm_power/fg_master 私有节点（可写）
+static const char *AL_CYCLE_COUNT[] = {
+    "cycle_count", "cyclecount", "cycle_count_now",
+    "cycle_cnt", "battery_cycle", "cycle", nullptr
 };
 
 // ============ 充电节点语义探测（声明部分）============
@@ -240,6 +249,19 @@ static void init_paths() {
               "wired_thermal_remove", "IC 温度限流解除", "/charger_thermal",
               AL_WIRED_THERMAL_RM, "thermal_remove");
 
+    // ---- 循环次数伪装（v1.4.9）----
+    // 两个口都要伪装，否则系统换一个口读就露馅：
+    //   ① fg_master/cyclecount   电量计私有节点，可写，是"真值来源"
+    //   ② power_supply/battery/cycle_count  AOSP 标准属性，只读，UI/第三方 App 走这个
+    // 语义解析走 cn_resolve：改名 / 换目录 / 换机型都能命中（见 AL_CYCLE_COUNT）。
+    CN_DEFINE(g_n_cycle_count, "TCB_CYCLE",
+              "/sys/class/xm_power/fg_master/cyclecount",
+              "cyclecount", "循环次数(主)", "/fg_master/",
+              AL_CYCLE_COUNT, "cycle");
+    CN_DEFINE(g_n_cycle_count2, "TCB_CYCLE2",
+              "/sys/class/power_supply/battery/cycle_count",
+              "cycle_count", "循环次数(从)", "/battery/",
+              AL_CYCLE_COUNT, "cycle");
     #undef CN_DEFINE
 }
 
@@ -258,6 +280,8 @@ static void init_paths() {
 #define N_BATT_STAT  (g_n_batt_stat.c_str())
 #define N_WIRED_CURR (g_n_wired_curr.c_str())
 #define N_THERMAL_RM (g_n_thermal_rm.c_str())
+#define N_CYCLE      (g_n_cycle_count.c_str())
+#define N_CYCLE2     (g_n_cycle_count2.c_str())
 
 // OS4 实测：wired_chg_curr 抬到 18A 后电流饱和（20A/22A 反而回落），
 // 因此满额取 18A 而非 22A —— 22A 是寄存器允许值，但不是有效上限。
@@ -268,6 +292,13 @@ static const int  DEF_TEMP      = 350;   // 35.0C
 static const int  POLL_CHARGING = 1;     // 充电时轮询秒（温度墙需要快速响应）
 static const int  POLL_IDLE     = 10;    // 空闲轮询秒
 static const int  FLUSH_INTERVAL = 3;    // 真实温度快照刷新间隔（秒），与轮询解耦
+// 循环次数伪装（v1.4.9）
+// 语义：把电池循环次数伪装成指定值。0 = 不干预（默认，保持原值）。
+// 合法区间 1~9999 —— 上限取 9999 而不是更大，是因为部分电量计把该值
+//   存成 uint16 存于 EEPROM，写入过大会被固件拒绝或回绕，反而暴露异常。
+static const int  CYCLE_MIN      = 0;      // 0 = 关闭伪装
+static const int  CYCLE_MAX      = 9999;
+static const int  DEF_CYCLE      = 0;      // 默认关闭
 
 // 排除的 zone 类型（精确匹配）
 // 基带 / 射频节点真实温度可达 83~89℃，伪装后系统读不到，风险过高，
@@ -2005,6 +2036,199 @@ static int do_scan(bool verbose) {
 #define TEMP_MIN (-40000)
 #define TEMP_MAX (120000)
 
+// ============ 循环次数伪装（v1.4.9）============
+//
+// 需求来源：电池循环次数是二手估价/保修判定的关键指标，用户希望能伪装。
+//
+// 设计原则（与温度伪装保持同一套架构）：
+//   1) 节点路径不写死 —— 走 CN_DEFINE 语义解析，改名/换目录/换机型都能命中
+//   2) 开关不默认开 —— 默认 0 = 不干预，保持原值（写坏循环次数可能影响保修判定，
+//      必须用户显式开启）
+//   3) 双口同伪 —— battery/cycle_count（AOSP 标准，UI 走这个）与
+//      fg_master/cyclecount（小米私有，电量计真值）都处理，避免只伪装一个而露馅
+//   4) 可完整回滚 —— 原值记在 cycle_orig.conf，restore 时优先"直写还原"，
+//      失败才依赖 umount（因为 bind mount 内写入不会穿透到底层文件）
+//
+// 为什么用 bind mount 而不是直接写：
+//   实测 battery/cycle_count 权限 -r--r--r--，连 root 打开 O_WRONLY 都失败；
+//   fg_master/cyclecount 虽可写（-rw-rw-r--），但驱动会在下次采样时用私有
+//   寄存器值覆盖，写入不持久。bind mount 对两者都有效，且 unlink 即恢复。
+
+// 前向声明：apply_cycle_mask() 会在关闭分支里调 restore_cycle_mask()，
+// 而 restore_cycle_mask() 定义在它之后，必须先声明。
+static int restore_cycle_mask();
+
+#define CYCLE_CONF   (g_work + "/cycle_orig.conf")
+#define CYCLE_FAKE   (g_fake + "/cycle_count")
+
+// 读取用户设定的目标循环次数（0 = 关闭伪装）。
+// 存 <WORK>/cycle_target.conf，与 target.conf（温度）并列，互不干扰。
+static int read_target_cycle() {
+    char p[256];
+    snprintf(p, sizeof(p), "%s/cycle_target.conf", WORK_DIR);
+    int v = 0;
+    if (read_int(p, &v) && v >= CYCLE_MIN && v <= CYCLE_MAX) return v;
+    return DEF_CYCLE;
+}
+
+// 记录原始循环次数（供 restore 精确还原）。
+// 只记首次值：重复 apply 不能覆盖，否则记下的是伪装后的值。
+static void save_cycle_orig() {
+    if (access(CYCLE_CONF.c_str(), F_OK) == 0) return;   // 已有基线，不覆盖
+    int v1 = 0, v2 = 0;
+    bool ok1 = read_int(N_CYCLE, &v1);
+    bool ok2 = read_int(N_CYCLE2, &v2);
+    if (!ok1 && !ok2) return;
+    FILE *fp = fopen(CYCLE_CONF.c_str(), "w");
+    if (!fp) return;
+    fprintf(fp, "%d %d\n", ok1 ? v1 : -1, ok2 ? v2 : -1);
+    fclose(fp);
+    logf("[cycle] 记录原始循环次数: 主=%d 从=%d", ok1 ? v1 : -1, ok2 ? v2 : -1);
+}
+
+// 把节点路径解析成真实路径。
+//
+// 为什么必须这么做（实测教训）：
+//   节点语义自适配给出的是 /sys/class/power_supply/battery/cycle_count，
+//   这是条软链，真身是 /sys/devices/platform/.../battery/cycle_count。
+//   mount(2) 会解析软链、把挂载登记在真身上；而 count_layers() 用 strcmp
+//   精确比对挂载点字符串，拿软链路径永远匹配不到 → unmount_all() 判定 0 层、
+//   直接 break、一层都不卸。随后源文件被 unlink，挂载变成孤儿，
+//   节点从 fs 里"消失"（读报 No such file）。
+//   → 挂载/卸载/计数三处必须用同一个规范路径，这里统一走 realpath。
+static std::string cycle_real_path(const std::string &node) {
+    if (node.empty()) return node;
+    char buf[PATH_MAX];
+    if (realpath(node.c_str(), buf)) return std::string(buf);
+    return node;   // 解析失败（节点不存在）就原样返回，由调用方判可读性
+}
+
+// 挂载单个循环节点为假值。返回 1 = 已伪装，0 = 跳过，-1 = 失败。
+static int cycle_mask_one(const std::string &node_in, int want) {
+    if (node_in.empty()) return 0;
+    // 一开始就规范化：后续 mount / umount / count_layers / 回读全部用同一个路径
+    const std::string node = cycle_real_path(node_in);
+    if (!node_readable(node.c_str())) {
+        logf("[cycle] 节点不可读，跳过: %s", node.c_str());
+        return 0;
+    }
+    // 假值文件（全模块共一份，内容即目标值）
+    ensure_dir(FAKE_DIR);
+    int fd = open(CYCLE_FAKE.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
+    if (fd < 0) {
+        logf("[cycle] 创建假值文件失败 %s: %s", CYCLE_FAKE.c_str(), strerror(errno));
+        return -1;
+    }
+    char b[16];
+    int n = snprintf(b, sizeof(b), "%d\n", want);
+    ssize_t w = write(fd, b, n); (void)w;
+    close(fd);
+
+    // 先剥干净旧挂载，避免叠层（与温度同样踩过 1→2→4 的坑）
+    if (unmount_all(node.c_str()) < 0) {
+        logf("[cycle] 清理旧挂载失败: %s", node.c_str());
+        return -1;
+    }
+    if (mount(CYCLE_FAKE.c_str(), node.c_str(), nullptr, MS_BIND, nullptr) != 0) {
+        logf("[cycle] 挂载失败 %s: %s", node.c_str(), strerror(errno));
+        return -1;
+    }
+    // 挂完立即回读验证（与 fix5 同一思路：挂上了不等于读对了）
+    int got = -1;
+    if (!read_int(node.c_str(), &got) || got != want) {
+        logf("[cycle] 挂载后回读不符 %s: 期望 %d 实际 %d",
+             node.c_str(), want, got);
+        umount(node.c_str());
+        return -1;
+    }
+    // 记入统一清单，restore 时不依赖重新枚举
+    {
+        int mf = open(MOUNT_LIST, O_WRONLY | O_CREAT | O_APPEND | O_CLOEXEC, 0644);
+        if (mf >= 0) {
+            std::string rec = node + "\n";
+            ssize_t wr = write(mf, rec.data(), rec.size()); (void)wr;
+            close(mf);
+        }
+    }
+    logf("[cycle] 已伪装 %s = %d", node.c_str(), got);
+    return 1;
+}
+
+// 应用循环次数伪装。返回成功伪装的节点数；目标为 0（关闭）时返回 0 且不做任何事。
+static int apply_cycle_mask() {
+    int want = read_target_cycle();
+    if (want <= 0) {
+        // 关闭状态：确保没有残留挂载（用户可能从开启切到关闭）
+        restore_cycle_mask();
+        return 0;
+    }
+    if (want < CYCLE_MIN || want > CYCLE_MAX) {
+        logf("[cycle] 目标值非法 %d（合法 %d~%d），跳过", want, CYCLE_MIN, CYCLE_MAX);
+        return 0;
+    }
+    save_cycle_orig();
+    int n = 0;
+    int r = cycle_mask_one(g_n_cycle_count, want);
+    if (r > 0) n += r;
+    else if (r < 0) logf("[cycle] 主节点伪装失败: %s", N_CYCLE);
+    r = cycle_mask_one(g_n_cycle_count2, want);
+    if (r > 0) n += r;
+    else if (r < 0) logf("[cycle] 从节点伪装失败: %s", N_CYCLE2);
+    return n;
+}
+
+// 撤销循环次数伪装。返回卸载成功的节点数。
+//
+// 为什么不只靠 umount：
+//   bind mount 是"视图替换"，底层文件从未被改写 → umount 后原值自动回来，
+//   不需要再写回。但如果历史上曾经直写过可写口（旧版本行为），
+//   底层文件已被改写，此时必须显式写回 cycle_orig.conf 里的原值。
+static int restore_cycle_mask() {
+    // 计的是"成功卸掉几层"。unmount_all 返回 0 表示该节点本来就没挂载，
+    // 返回 -1 表示卸不干净（被别的进程持 fd 等）。两者都不该计入层数。
+    int n = 0;
+    // 同样要规范化：否则 count_layers 数不到 mount 登记在真身上的层
+    const std::string nodes[2] = { cycle_real_path(g_n_cycle_count),
+                                  cycle_real_path(g_n_cycle_count2) };
+    for (int i = 0; i < 2; i++) {
+        if (nodes[i].empty()) continue;
+        int r = unmount_all(nodes[i].c_str());
+        if (r > 0) n += r;
+    }
+    // 【重要】假值文件只能在卸固成功之后删除。
+    //
+    // bind mount 的源文件一旦被 unlink，挂载就变成孤儿挂载：
+    // 挂载点会变成不可访问状态（ls 显示 ?????????），而且之后再也 umount 不掉，
+    // 节点相当于永久损坏到重启为止。实测踩过：setcycle 0 之后两个
+    // cycle 节点全部变成 ?? 状态，只能靠重建假文件才能救回来。
+    //
+    // 所以：卸载没清零就保留源文件（下次还能卸），清完了才允许删。
+    int remain = 0;
+    for (int i = 0; i < 2; i++) {
+        if (nodes[i].empty()) continue;
+        remain += count_layers(nodes[i].c_str());
+    }
+
+    // 按基线写回（仅对可写节点有效；只读节点写回失败属正常）
+    FILE *fp = fopen(CYCLE_CONF.c_str(), "r");
+    if (fp) {
+        int v1 = -1, v2 = -1;
+        if (fscanf(fp, "%d %d", &v1, &v2) == 2) {
+            if (v1 >= 0 && !g_n_cycle_count.empty()) write_int(N_CYCLE, v1);
+            if (v2 >= 0 && !g_n_cycle_count2.empty()) write_int(N_CYCLE2, v2);
+        }
+        fclose(fp);
+        unlink(CYCLE_CONF.c_str());
+    }
+    // 还有残留层 → 源文件不能删，留着下次继续卸
+    if (remain == 0) {
+        unlink(CYCLE_FAKE.c_str());
+    } else {
+        logf("[cycle] 仍有 %d 层挂载未卸净，保留假值文件避免孤儿挂载", remain);
+    }
+    return n;
+}
+
 static int apply_temp(int want) {
     if (want < TEMP_MIN || want > TEMP_MAX) {
         logf("[apply] 拒绝非法温度 %d（合法区间 %d~%d，单位 0.001℃）",
@@ -2118,6 +2342,18 @@ static int apply_temp(int want) {
     // 充电提速节点
     write_int(N_CTRL_LIMIT, 0);
     write_int(N_PPS_PTF, 1);
+    // ---- 循环次数伪装（v1.4.9）----
+    // 为什么放在温度挂载之后：循环次数与温度无关，互不干扰；
+    // 放在这里可以复用上面已经完成的 fake/real 目录建立与 open_real_fds。
+    //
+    // 两路策略（按节点性质分别处理）：
+    //   ① battery/cycle_count（-r--r--r-- 只读）：只能 bind mount 覆盖
+    //   ② fg_master/cyclecount（-rw-rw-r-- 可写）：优先直接写；写不进去再 bind mount
+    // 只挂其中一个会导致"换一个口读就露馅"，所以两个都处理。
+    int cycle_mounted = apply_cycle_mask();
+    if (cycle_mounted >= 0)
+        logf("[apply] 循环次数伪装: 生效 %d 个节点（目标 %d）",
+             cycle_mounted, read_target_cycle());
 
     // OS4：解除 IC 级充电温度限流（OS3 无此节点，thermal_ok=0 自动跳过）。
     // 这是实测最有效的提速手段：+0.74A，且不需要改 wired_chg_curr 的档位。
@@ -2663,6 +2899,68 @@ static void spawn_daemon_if_needed(const char *self) {
         _exit(127);
     }
     logf("[apply] daemon not running, spawned pid=%d", (int)p);
+}
+
+// v1.4.9: 停机 daemon 并等它真正退出。
+//
+// 为什么 restore 必须先做这一步：
+//   daemon 常驻时持有全部 thermal 节点的持久 fd（97 个）。Linux 的 umount 语义要求
+//   "该挂载下不存在被打开的引用"，只要有进程还握着挂载点里的文件 fd，umount 就返回
+//   EBUSY。实测：daemon 存活时 zone5 层数=1、umount rc=1、值恒为 350；kill -9 之后
+//   同一路径立刻 rc=0、值回到 52500（真值）。
+//   所以 "恢复原值按钮点了没反应、温度还是假的" 不是 restore 算法错，而是 daemon
+//   在它背后保住了挂载视图。先把 daemon 停干净，unmount 才有意义。
+//
+// 顺序：SIGTERM（留出让它自己收尾的时间）-> 轮询等待 -> 超时补 SIGKILL -> 删 pid 文件。
+static void kill_daemon_blocking() {
+    char p[128];
+    snprintf(p, sizeof(p), "%s/daemon.pid", WORK_DIR);
+    int pid = 0;
+    bool have = read_int(p, &pid) && pid > 0;
+
+    // pid 文件可能丢了但进程还在（手动 kill -9 过、或被别的脚本清过），
+    // 这时按 cmdline 反查，避免漏杀导致后面 umount 继续 EBUSY。
+    if (!have) {
+        for (int d = 1; d < 32768; d++) {
+            char cp[64];
+            snprintf(cp, sizeof(cp), "/proc/%d/cmdline", d);
+            int fd = open(cp, O_RDONLY | O_CLOEXEC);
+            if (fd < 0) continue;
+            char cb[512] = {0};
+            ssize_t n = read(fd, cb, sizeof(cb) - 1);
+            close(fd);
+            if (n <= 0) continue;
+            for (ssize_t i = 0; i < n; i++) if (cb[i] == '\0') cb[i] = ' ';
+            if (strstr(cb, "temp_charge_boost") && strstr(cb, "daemon")) { pid = d; have = true; break; }
+        }
+    }
+
+    if (have && pid > 0 && pid != getpid()) {
+        kill(pid, SIGTERM);
+        // 最多等 3 秒（300 x 10ms）。只等 pid 消失，不判断别的。
+        bool gone = false;
+        for (int i = 0; i < 300; i++) {
+            char lp[32];
+            snprintf(lp, sizeof(lp), "/proc/%d", pid);
+            if (access(lp, F_OK) != 0) { gone = true; break; }
+            struct timespec ts = {0, 10 * 1000 * 1000};
+            nanosleep(&ts, nullptr);
+        }
+        if (!gone) {
+            kill(pid, SIGKILL);
+            for (int i = 0; i < 100; i++) {
+                char lp[32];
+                snprintf(lp, sizeof(lp), "/proc/%d", pid);
+                if (access(lp, F_OK) != 0) break;
+                struct timespec ts = {0, 10 * 1000 * 1000};
+                nanosleep(&ts, nullptr);
+            }
+            logf("[restore] daemon %d 未响应 SIGTERM，已 SIGKILL", pid);
+        } else {
+            logf("[restore] daemon %d 已退出", pid);
+        }
+    }
+    unlink(p);
 }
 // 每轮调用：充电时执行温度墙判定，必要时写上限；降温后恢复
 // 配置从 wall.conf 读取（"启用 阈值x10" 两字段），WebUI 改完即时生效
@@ -3337,6 +3635,10 @@ static const char *AL_BAT_CURRENT[] = {
 static const char *AL_BAT_CAPACITY[] = {
     "capacity", "capacity_level", "soc", nullptr
 };
+// 电池循环次数（v1.4.9）：不同厂商叫法差异大，必须列全
+//   cycle_count    AOSP power_supply 标准属性（battery 侧，只读）
+//   cyclecount     小米 xm_power/fg_master 私有节点（可写）
+//   cycle_count_now / cycle_cnt / battery_cycle  常见变体
 static const char *AL_BAT_STATUS[] = {
     "status", "batt_status", "charge_status", nullptr
 };
@@ -3464,8 +3766,24 @@ static std::string cn_resolve_ro(const RoSpec &sp, const std::string &known) {
         //   反例：bat_temp 的 known 是 power_supply/battery/temp，
         //         原先只在模糊层卡目录 → 命中了 thermal/xiaomi_batt/temp
         //         （0.001℃ 刻度 43500），按 0.1℃ 语义用会差 10 倍。
+        // v1.4.9: dir_allow 支持 "a|b|c" 多选形式（任一命中即通过）。
+        // 原实现只做单一子串匹配，写 "xm_power|power_supply" 会永远不命中。
+        // 为什么需要多选：同一语义节点在不同版本/机型分别落在
+        // xm_power（小米私有）与 power_supply（AOSP 标准）两个体系，
+        // 单一目录名会把另一种可能直接排除。
         if (sp.dir_allow && *sp.dir_allow) {
-            if (p.find(sp.dir_allow) == std::string::npos) continue;
+            bool allow = false;
+            const char *a = sp.dir_allow;
+            while (*a) {
+                const char *bar = a;
+                while (*bar && *bar != '|') bar++;
+                if (bar > a) {
+                    std::string one(a, (size_t)(bar - a));
+                    if (p.find(one) != std::string::npos) { allow = true; break; }
+                }
+                a = (*bar == '|') ? bar + 1 : bar;
+            }
+            if (!allow) continue;
         }
         if (cn_avoided(p, CN_AVOID_COMMON)) continue;
         // 互斥占用：非 100 分不得复用其它 key 已占路径
@@ -3509,6 +3827,11 @@ static void ro_init() {
           AL_BAT_CURRENT,  "current",  "power_supply", DA_BAT },
         { "bat_capacity","/sys/class/power_supply/battery/capacity",
           AL_BAT_CAPACITY, "capacity", "power_supply", DA_BAT },
+        // 循环次数（v1.4.9）：走同一套只读语义层，改名/换目录也能读到。
+        // known 指向 fg_master（可写、且是电量计真值来源），
+        // 别名表覆盖 battery/cycle_count（AOSP 标准属性，只读）。
+        { "bat_cycle", "/sys/class/xm_power/fg_master/cyclecount",
+          AL_CYCLE_COUNT, "cycle", "xm_power|power_supply", DA_BAT },
         { "bat_status",  "/sys/class/power_supply/battery/status",
           AL_BAT_STATUS,   "status",   "power_supply", DA_BAT },
         { "bat_temp",    "/sys/class/power_supply/battery/temp",
@@ -3751,6 +4074,36 @@ static void dump_json() {
     printf("\"bat_voltage\":%d,", bat_v);
     printf("\"bat_current\":%d,", bat_i);
     printf("\"capacity\":%d,", cap);
+    // === 循环次数伪装状态（v1.4.9）===
+    //   cycle_target : 用户设定的目标值（0 = 关闭伪装）
+    //   cycle_now    : 节点当前读到值（伪装生效时等于 target）
+    //   cycle_real   : 基线原值，来源优先级 cycle_orig.conf > 当前读值
+    //   cycle_masked : 是否已真正伪装（目标 > 0 且节点读回等于目标）
+    {
+        int cy_t = read_target_cycle();
+        int cy_now = -1, cy_r = -1;
+        bool cy_ok = false;
+        if (!g_n_cycle_count.empty()) cy_ok = read_int(N_CYCLE, &cy_now);
+        if (!cy_ok && !g_n_cycle_count2.empty()) cy_ok = read_int(N_CYCLE2, &cy_now);
+        char op[192];
+        snprintf(op, sizeof(op), "%s/cycle_orig.conf", WORK_DIR);
+        FILE *cf = fopen(op, "r");
+        if (cf) {
+            int o1 = -1, o2 = -1;
+            if (fscanf(cf, "%d %d", &o1, &o2) == 2) cy_r = (o1 >= 0) ? o1 : o2;
+            fclose(cf);
+        }
+        if (cy_r < 0) cy_r = cy_ok ? cy_now : 0;
+        if (!cy_ok) cy_now = 0;
+        bool cy_masked = (cy_t > 0 && cy_now == cy_t);
+        printf("\"cycle_target\":%d,", cy_t);
+        printf("\"cycle_now\":%d,", cy_now);
+        printf("\"cycle_real\":%d,", cy_r);
+        printf("\"cycle_masked\":%s,", cy_masked ? "true" : "false");
+        // 两个节点是否都解析到了（WebUI 据此提示"本机只支持单口"）
+        printf("\"cycle_ports\":%d,",
+               (!g_n_cycle_count.empty() ? 1 : 0) + (!g_n_cycle_count2.empty() ? 1 : 0));
+    }
     printf("\"status\":\"%s\",", status.c_str());
     printf("\"charging\":%s,", is_charging() ? "true" : "false");
     printf("\"daemon_alive\":%s,", daemon_alive ? "true" : "false");
@@ -3829,7 +4182,29 @@ int main(int argc, char **argv) {
         if (n > 0) spawn_daemon_if_needed(argv[0]);
         return n > 0 ? 0 : 1;
     }
-    else if (!strcmp(cmd, "restore")) { restore_temp(); return 0; }
+    else if (!strcmp(cmd, "restore")) {
+        // v1.4.9 修正：restore 必须先把 daemon 停干净，再卸挂载。
+        //
+        // 旧版只调 restore_temp()，daemon 仍活着并持有 97 个 thermal fd，
+        // umount 一律返回 EBUSY → 挂载纹丝不动 → 用户看到"点了恢复原值，
+        // 温度还是假的"。这不是 restore 没执行，是它执行不动。
+        //
+        // 顺序：停 daemon → 卸温度 → 卸循环次数 → 清 fake/real 缓存。
+        kill_daemon_blocking();
+        int m1 = restore_temp();
+        int m2 = restore_cycle_mask();
+        // 恢复原值意味着"伪装彻底关掉"，目标值必须一并清掉。
+        // 否则下次 apply / 开机自启会读到陈旧的 cycle_target.conf，
+        // 用户刚点完恢复，重启又被挂上 —— 这正是需要消灭的那类行为。
+        // 顺手也清温度目标，语义保持一致（restore = 回到未伪装状态）。
+        {
+            char cp[192];
+            snprintf(cp, sizeof(cp), "%s/cycle_target.conf", WORK_DIR);
+            unlink(cp);
+        }
+        printf("已恢复原值：温度节点 %d 个，循环次数节点 %d 个\n", m1, m2);
+        return 0;
+    }
     else if (!strcmp(cmd, "status"))  show_status();
     else if (!strcmp(cmd, "dump"))    dump_json();
     else if (!strcmp(cmd, "profile")) {
@@ -3892,6 +4267,79 @@ int main(int argc, char **argv) {
         logf("亮度设为 %d%%", pct);
         printf("{\"ok\":%s,\"pct\":%d,\"raw\":%d}\n", ok ? "true" : "false", pct, bl_cur_raw());
         return ok ? 0 : 1;
+    }
+    else if (!strcmp(cmd, "setcycle")) {
+        // setcycle            → 打印当前循环次数伪装状态（JSON）
+        // setcycle <0-9999>   → 设为该值（0 = 关闭伪装），写完立即生效
+        //
+        // 为什么不叫 "cycle"：避免与 scan 的语义探测关键字混淆，也方便脚本里 grep。
+        const char *a2 = argc > 2 ? argv[2] : NULL;
+        char p[192];
+        snprintf(p, sizeof(p), "%s/cycle_target.conf", WORK_DIR);
+
+        int cur_t = read_target_cycle();
+        if (!a2) {
+            int now = -1, real = -1;
+            if (!g_n_cycle_count.empty()) read_int(N_CYCLE, &now);
+            if (now < 0 && !g_n_cycle_count2.empty()) read_int(N_CYCLE2, &now);
+            char op[192];
+            snprintf(op, sizeof(op), "%s/cycle_orig.conf", WORK_DIR);
+            FILE *cf = fopen(op, "r");
+            if (cf) { int o1=-1,o2=-1; if (fscanf(cf,"%d %d",&o1,&o2)==2) real=(o1>=0)?o1:o2; fclose(cf); }
+            printf("{\"ok\":true,\"target\":%d,\"now\":%d,\"real\":%d,\"ports\":%d}\n",
+                   cur_t, now < 0 ? 0 : now, real < 0 ? 0 : real,
+                   (!g_n_cycle_count.empty() ? 1 : 0) + (!g_n_cycle_count2.empty() ? 1 : 0));
+            return 0;
+        }
+
+        // 严格解析：atoi("abc") 返回 0，会被当成"关闭伪装"静默执行，
+        // 这是一个危险的静默行为（用户打错字就把伪装关了）。
+        // 所以先校验整串必须是十进制数字，否则直接报错不执行任何挂载操作。
+        {
+            const char *q = a2;
+            if (*q == '+' || *q == '-') q++;
+            if (*q == '\0') {
+                printf("{\"ok\":false,\"why\":\"not_number\"}\n");
+                return 1;
+            }
+            for (const char *t = q; *t; t++) {
+                if (*t < '0' || *t > '9') {
+                    printf("{\"ok\":false,\"why\":\"not_number\"}\n");
+                    return 1;
+                }
+            }
+        }
+        int want = atoi(a2);
+        if (want < 0) {
+            printf("{\"ok\":false,\"why\":\"range\",\"min\":%d,\"max\":%d}\n",
+                   CYCLE_MIN, CYCLE_MAX);
+            return 1;
+        }
+        if (want != 0 && (want < CYCLE_MIN || want > CYCLE_MAX)) {
+            printf("{\"ok\":false,\"why\":\"range\",\"min\":%d,\"max\":%d}\n",
+                   CYCLE_MIN, CYCLE_MAX);
+            return 1;
+        }
+
+        ensure_dir(WORK_DIR);
+        FILE *fp = fopen(p, "w");
+        if (!fp) {
+            printf("{\"ok\":false,\"why\":\"write_conf\"}\n");
+            return 1;
+        }
+        fprintf(fp, "%d\n", want);
+        fclose(fp);
+        logf("循环次数伪装: 目标 %d%s", want, want ? "" : "（关闭）");
+
+        // 写完立即生效：不需要用户再点一次「应用伪装」。
+        // want=0 时 apply_cycle_mask 内部会走 restore 分支卸挂载。
+        int n = apply_cycle_mask();
+        int now = -1;
+        if (!g_n_cycle_count.empty()) read_int(N_CYCLE, &now);
+        if (now < 0 && !g_n_cycle_count2.empty()) read_int(N_CYCLE2, &now);
+        printf("{\"ok\":true,\"target\":%d,\"masked_nodes\":%d,\"now\":%d}\n",
+               want, n, now < 0 ? 0 : now);
+        return 0;
     }
     else if (!strcmp(cmd, "wall")) {
         // wall                → 打印温度墙状态
