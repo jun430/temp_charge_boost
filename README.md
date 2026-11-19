@@ -222,6 +222,29 @@ temp_charge_boost log [行数]           # 日志尾部
 > 第 3 步是关键：若卸载时温度墙正在限流，不恢复电流会让充电永久卡在最低 3A，用户很难自查。
 
 ## 版本历史
+### v1.5.0 (2026-11-19)
+**修复 WebUI 拉起的守护进程被 Android Freezer 冻结。**
+从 WebUI 点「应用伪装」后，daemon 会跑几百毫秒然后彻底静默 —— 进程还在、`pidof` 查得到、
+WebUI 显示「运行中」，但一行日志不写、温度墙不生效。根因不在程序逻辑，而在进程所属的 cgroup。
+- 🐛 **根因**：`spawn_daemon_if_needed()` 在 App 进程内 `fork()`。`fork` 继承父进程 cgroup，
+  `setsid()` 只换会话、`execv()` 不换组，daemon 因此落在 `/apps/uid_XXXX/pid_YYYY`。
+  App 进 cached 后 Android Freezer 冻结整组，daemon 跟着停摆
+- 🐛 **表现**：`cgroup.events` 显示 `frozen 1`、`cgroup.freeze=1`、`utime` 恒为 0；
+  日志 mtime 停滞但文件存在；开机自启那条（`service.sh` 的 `setsid`，父进程是 init）不受影响，
+  因此长期被误判为「偶发不稳」
+- ✨ **修复**：新增 `cg_current_path()` + `detach_from_app_cgroup()`，在 `run_daemon()` 首行调用。
+  仅当自身位于 `/apps/` 前缀时写 `/sys/fs/cgroup/cgroup.procs` 迁回根组；
+  已在 `/` 或 `/system/` 组一律跳过；写失败静默降级，不影响 daemon 启动
+- ✨ **离线测试钩子**：`TCB_CG_SELF`（替代 `/proc/self/cgroup`）、`TCB_CG_ROOT`（替代 `/sys/fs/cgroup`），
+  可在沙箱内完整验证迁移逻辑而无需真实 App 进程
+**验证**
+| 项 | 结果 |
+|---|---|
+| 沙箱逻辑测试（14 组用例） | ✅ 27/27 |
+| 真内核裸迁移能力 | ✅ 9/9，`/apps/ → /` `write_rc=0` |
+| 端到端（原始故障 cgroup `/apps/uid_10332/pid_12285`） | ✅ 9/9，日志 `已迁出 App freezer 组: /apps/uid_10332/pid_12285 -> /` |
+| 抗冻结实证（60 秒采样） | ✅ `stime` 19→20→22→23→23→24 持续增长，`cgroup` 恒为 `/` |
+| 功能回归 | ✅ `mounted=86`、`layers=86`、`fake_temp=350`、`ctrl_limit=0` |
 ### v1.4.3 (2026-11-05)
 **卸载链路首次被真正测通，并修复三个卸载缺陷。**
 此前只测过 `tcb restore` 子命令，从未跑过真正的 `uninstall.sh` —— 补测后发现它连

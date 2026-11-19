@@ -3157,7 +3157,79 @@ static void wall_tick() {
 
 // ============ daemon ============
 
+// 读取本进程当前所属的 cgroup v2 路径（形如 /apps/uid_10332/pid_12285）。
+// 只用 /proc/self/cgroup，不做任何扫描。失败返回空串。
+// TCB_CG_SELF 是离线测试钩子：指向模拟的 cgroup 描述文件。
+static std::string cg_current_path() {
+    const char *mock = getenv("TCB_CG_SELF");
+    const char *path = (mock && *mock) ? mock : "/proc/self/cgroup";
+    FILE *fp = fopen(path, "r");
+    if (!fp) return std::string();
+    char line[512];
+    std::string out;
+    while (fgets(line, sizeof(line), fp)) {
+        // cgroup v2 统一层级行格式：0::/some/path
+        if (line[0] == '0' && line[1] == ':' && line[2] == ':') {
+            size_t n = strlen(line);
+            while (n > 0 && (line[n - 1] == '\n' || line[n - 1] == '\r')) line[--n] = 0;
+            out.assign(line + 3);
+            break;
+        }
+    }
+    fclose(fp);
+    return out;
+}
+
+// 把自身迁回 cgroup 根组，脱离 App 的 freezer 域（v1.5.0）
+//
+// 为什么必须做（实测根因）：
+//   WebUI（com.sukisu.ultra 的 WebView）点「应用伪装」时，spawn_daemon_if_needed()
+//   是在 App 进程里 fork 的。fork 继承父进程的 cgroup；setsid() 只换会话、
+//   execv() 不换组，于是子进程落在 /apps/uid_XXXX/pid_YYYY。
+//   App 退到 cached 后 Android Freezer 冻结整组，daemon 进程存活但 utime 恒为 0，
+//   不轮询、不写日志，pidof 和 WebUI 却仍显示「运行中」。
+//   实测现场：pid 13343 在 /apps/uid_10332/pid_12285，cgroup.freeze=1，utime=0。
+//   开机自启那条（service.sh 的 setsid）父进程是 init，天生在根组，所以不出问题。
+//
+// 只在「当前确实位于 /apps/ 之下」时迁移，不碰已在根组或其他系统组的进程。
+// 写失败（非 cgroup v2、只读挂载、SELinux 拒绝）一律静默忽略：
+// 这是可选优化，不能因为它让 daemon 起不来。
+// TCB_CG_ROOT 是离线测试钩子：指向模拟的 cgroup 目录树。
+static void detach_from_app_cgroup() {
+    std::string cur = cg_current_path();
+    if (cur.empty()) return;                        // 读不到：不干预
+    if (cur == "/") return;                         // 已在根组
+    if (cur.compare(0, 6, "/apps/") != 0) return;   // 不在 App 组，不干预
+
+    std::string base = env_or("TCB_CG_ROOT", "/sys/fs/cgroup");
+    std::string procs = base + "/cgroup.procs";
+
+    int fd = open(procs.c_str(), O_WRONLY | O_CLOEXEC);
+    if (fd < 0) {
+        logf("[cgroup] 迁移跳过：打不开 %s (%s)", procs.c_str(), strerror(errno));
+        return;
+    }
+    char b[16];
+    int n = snprintf(b, sizeof(b), "%d", (int)getpid());
+    ssize_t w = write(fd, b, n);
+    int werr = errno;
+    close(fd);
+
+    std::string after = cg_current_path();
+    if (w == n && after == "/") {
+        logf("[cgroup] 已迁出 App freezer 组: %s -> /", cur.c_str());
+    } else {
+        logf("[cgroup] 迁移未生效: %s -> %s (%s)", cur.c_str(),
+             after.empty() ? "?" : after.c_str(),
+             (w == n) ? "写入成功但读回未变" : strerror(werr));
+    }
+}
+
 static void run_daemon() {
+    // v1.5.0：必须在任何常驻逻辑之前。WebUI 拉起的 daemon 继承 App 的 cgroup，
+    // 不迁出来会被 Freezer 冻在后台（详见 detach_from_app_cgroup 注释）。
+    detach_from_app_cgroup();
+
     // 降低被杀的优先级
     int fd = open("/proc/self/oom_score_adj", O_WRONLY | O_CLOEXEC);
     if (fd >= 0) { write(fd, "-1000", 5); close(fd); }
